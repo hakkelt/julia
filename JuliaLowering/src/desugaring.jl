@@ -4210,6 +4210,16 @@ function expand_importpath(ctx, path)
     @ast ctx path [:. mapsyntax(_unplaceholder, children(path))...]
 end
 
+# `Parent::Sub` names subpackage `Sub` of package `Parent`; it is passed on as
+# `(:: (. Parent) Sub)`, which the runtime resolves with `Base.require_subpackage`
+function expand_module_path(ctx, path)
+    if head(path) == :(::)
+        @jl_assert numchildren(path) == 2 path
+        return @ast ctx path [:(::) expand_importpath(ctx, path[1]) _unplaceholder(path[2])]
+    end
+    return expand_importpath(ctx, path)
+end
+
 function _unplaceholder(st)
     k = head(st)
     k === :placeholder || k === :symbol ? @mknode(st; head=:identifier) :
@@ -4229,7 +4239,7 @@ function expand_import_or_using(ctx, ex)
         #  (call core.svec  2 "x" "y" "z"  1 "w" "w"))
         @jl_assert numchildren(ex[1]) >= 1 ex
         from = ex[1][1]
-        from_path = @ast ctx from [:inert expand_importpath(ctx, from)]
+        from_path = @ast ctx from [:inert expand_module_path(ctx, from)]
         paths = ex[1][2:end]
     else
         # import A.B
@@ -4245,9 +4255,9 @@ function expand_import_or_using(ctx, ex)
         if head(spec) == :as
             @jl_assert numchildren(spec) == 2 spec
             s2 = _unplaceholder(spec[2])
-            path = @ast ctx spec [:as expand_importpath(ctx, spec[1]) s2]
+            path = @ast ctx spec [:as expand_module_path(ctx, spec[1]) s2]
         else
-            path = expand_importpath(ctx, spec)
+            path = expand_module_path(ctx, spec)
         end
         push!(path_specs, @ast ctx spec [:inert path])
     end

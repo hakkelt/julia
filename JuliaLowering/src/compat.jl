@@ -104,6 +104,9 @@ function dst_importpath(ctx, st::SyntaxTree)
             @ast _ st [:as dst_importpath(ctx, st[1]) est_to_dst(ctx, name)]
         [:. xs...] ->
             @ast _ st [:importpath map_est_to_dst(ctx, xs)...]
+        # subpackage `Parent::Sub`
+        [:(::) p name] ->
+            @ast _ st [:(::) dst_importpath(ctx, p) est_to_dst(ctx, name)]
     end
 end
 
@@ -558,7 +561,7 @@ function est_to_dst(ctx::SyntaxCompatContext, st::SyntaxTree)
         ([:let binds body], when=(head(binds) !== :block)) ->
             @ast _ st [:let [:block(binds) rec(ctx, binds)] rec(ctx, body)]
         (_, when=(head(st) === :using || head(st) === :import)) -> let
-            # dot_importpath = (. _...)
+            # dot_importpath = (. _...) | (:: (. _...) name)
             # as_or_dotip = dot_importpath | (as dot_importpath name)
             # replaces dot_importpath with (importpath _...) in
             # (using as_or_dotip...)

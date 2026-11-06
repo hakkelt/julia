@@ -442,6 +442,18 @@ vst1_importpath_dots(vcx, st) = vst1_importpath(vcx, st; dots_ok=true)
 vst1_importpath_nodots(vcx, st) = vst1_importpath(vcx, st; dots_ok=false)
 function vst1_importpath(vcx, st; dots_ok)
     ok = pass()
+    # A subpackage, `Parent::Sub` or `Parent::Sub as name` (syntax version 1.15+). That
+    # `Parent` names a top-level package is checked when the import is evaluated.
+    sub = head(st) === :as && numchildren(st) == 2 ? st[1] : st
+    if head(sub) === :(::)
+        if head(st) === :as && head(st[2]) !== :identifier
+            ok &= @fail(st[2], "expected identifier")
+        end
+        dots_ok || return ok & @fail(sub, "a subpackage `Parent::Sub` cannot follow `:`")
+        numchildren(sub) == 2 || return @fail(sub, "malformed import path")
+        head(sub[2]) === :identifier || (ok &= @fail(sub[2], "expected subpackage name"))
+        return ok & vst1_importpath(vcx, sub[1]; dots_ok=true)
+    end
     path_components = @stm st begin
         [:as [:. xs...] [:identifier]] -> xs
         [:as [:. xs...] x] -> (ok &= @fail(x, "expected identifier"); xs)
