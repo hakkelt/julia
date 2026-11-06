@@ -955,8 +955,10 @@ end
 #     Common = []                       # code in sub/Common.jl or sub/Common/Common.jl
 #     Tsit5 = ["Common"]                # may depend on sibling subpackages...
 #     Plots = ["Common", "Makie"]       # ...and on [weakdeps] of the parent
+#     Recipes = { deps = ["Common", "Makie"], autoload = true }
 #
-# An entry may also be a table, `Tsit5 = { deps = ["Common"] }`, leaving room for more keys.
+# An entry may also be a table, `Tsit5 = { deps = ["Common"] }`. Its `autoload` key makes the
+# subpackage load automatically, like an extension (see `subpackage_autoload_triggers`).
 # The identity of a subpackage is `PkgId(uuid5(parent_uuid, name), name)`, the same scheme
 # as for extensions. A subpackage may load the parent, any of the parent's [deps], and the
 # weakdeps and sibling subpackages that it lists. Unlike the parent's [deps], weakdeps
@@ -1904,6 +1906,7 @@ function insert_extension_triggers(pkg::PkgId)
 end
 
 function insert_extension_triggers(env::String, pkg::PkgId)::Union{Nothing,Missing}
+    insert_subpackage_triggers(env, pkg)
     project_file = env_project_file(env)
     if project_file isa String || project_file
         implicit_project_file = project_file
@@ -2007,6 +2010,113 @@ function _insert_extension_triggers(parent::PkgId, extensions::Dict{String, Any}
     end
 end
 
+# Subpackages with `autoload` are woken up by the extension machinery above: they are
+# registered in `EXT_PRIMED`/`EXT_DORMITORY` with the parent as the first trigger.
+#
+#   autoload = true          triggers: the weakdeps the subpackage needs, including those
+#                            of the sibling subpackages it depends on, transitively
+#   autoload = ["A", "B"]    triggers: exactly these (they must be [deps] or [weakdeps])
+#
+# The subpackage may still need dependencies that are not triggers; it loads them itself.
+# Autoloading only loads the module: names come into scope only with an explicit
+# `@subpackage using Parent::Sub`.
+function subpackage_autoload_triggers(d::Dict{String, Any}, name::String)::Union{Nothing, Vector{String}}
+    subs = get(d, "subpackages", nothing)::Union{Nothing, Dict{String, Any}}
+    subs === nothing && return nothing
+    entry = get(subs, name, nothing)
+    entry isa Dict{String, Any} || return nothing
+    autoload = get(entry, "autoload", false)
+    autoload === false && return nothing
+    if autoload isa Vector
+        all(x -> x isa String, autoload) && return String[x::String for x in autoload]
+    elseif autoload === true
+        weakdeps = get(Dict{String, Any}, d, "weakdeps")::Dict{String, Any}
+        triggers = String[]
+        seen = Set{String}()
+        todo = String[name]
+        while !isempty(todo)
+            sub = pop!(todo)
+            sub in seen && continue
+            push!(seen, sub)
+            for dep in something(subpackage_deps(d, sub), String[])
+                if subpackage_deps(d, dep) !== nothing
+                    push!(todo, dep)       # sibling: it does not trigger, but its weakdeps do
+                elseif haskey(weakdeps, dep) && !(dep in triggers)
+                    push!(triggers, dep)
+                end
+            end
+        end
+        return triggers
+    end
+    @warn "Ignoring `autoload` for subpackage $name: it must be `true`, `false` or a list of package names, got $(repr(autoload))"
+    return nothing
+end
+
+function insert_subpackage_triggers(env::String, pkg::PkgId)
+    pkg.uuid === nothing && return
+    spec = manifest_uuid_load_spec(env, pkg)
+    spec isa PkgLoadSpec || return
+    project_file = package_root_project_file(spec.path)
+    project_file === nothing && return
+    d = parsed_toml(project_file)
+    subs = get(d, "subpackages", nothing)::Union{Nothing, Dict{String, Any}}
+    subs === nothing && return
+    # `pkg` could itself be a subpackage, living in `sub/` of the project we just found
+    project_file_name_uuid(project_file, pkg.name) == pkg || return
+    totaldeps = merge(get(Dict{String, Any}, d, "weakdeps")::Dict{String, Any},
+                      get(Dict{String, Any}, d, "deps")::Dict{String, Any})
+    autoloads = Dict{String, Any}()
+    for name in keys(subs)
+        triggers = subpackage_autoload_triggers(d, name)
+        triggers === nothing && continue
+        unknown = filter(t -> !haskey(totaldeps, t), triggers)
+        if !isempty(unknown)
+            @warn "Ignoring `autoload` for subpackage $name of $(pkg.name): triggers $(join(unknown, ", ")) \
+                   are not in its [deps] or [weakdeps]"
+            continue
+        end
+        autoloads[name] = triggers
+    end
+    isempty(autoloads) || _insert_extension_triggers(pkg, autoloads, totaldeps)
+    for name in keys(autoloads)
+        siblings = PkgId[PkgId(uuid5(pkg.uuid::UUID, s), s) for s in subpackage_sibling_closure(d, name)]
+        isempty(siblings) || (SUBPKG_AUTOLOAD_SIBLINGS[PkgId(uuid5(pkg.uuid::UUID, name), name)] = siblings)
+    end
+    return
+end
+
+# The sibling subpackages that subpackage `name` depends on, directly or not
+function subpackage_sibling_closure(d::Dict{String, Any}, name::String)
+    siblings = String[]
+    todo = String[name]
+    while !isempty(todo)
+        sub = pop!(todo)
+        for dep in something(subpackage_deps(d, sub), String[])
+            if subpackage_deps(d, dep) !== nothing && dep != name && !(dep in siblings)
+                push!(siblings, dep)
+                push!(todo, dep)
+            end
+        end
+    end
+    return siblings
+end
+
+# Autoload subpackage -> the sibling subpackages it depends on
+const SUBPKG_AUTOLOAD_SIBLINGS = Dict{PkgId, Vector{PkgId}}()
+
+# An autoload subpackage must not load while a sibling it depends on is itself still
+# loading or being precompiled: that sibling loading the parent and the triggers would
+# otherwise pull in the autoload subpackage, which needs the unfinished sibling (a cycle).
+# Returns such a sibling, if any.
+function subpackage_inflight_sibling(id::PkgId)::Union{Nothing, PkgId}
+    siblings = get(SUBPKG_AUTOLOAD_SIBLINGS, id, nothing)
+    siblings === nothing && return nothing
+    for s in siblings
+        (haskey(package_locks, s) || s in precompilation_stack) && return s
+    end
+    return nothing
+end
+
 loading_extension::Bool = false
 loadable_extensions::Union{Nothing,Vector{PkgId}} = nothing
 precompiling_extension::Bool = false
@@ -2045,6 +2155,13 @@ function run_extension_callbacks(pkgid::PkgId)
         @assert extid.ntriggers > 0
         extid.ntriggers -= 1
         if extid.ntriggers == 0 && (loadable_extensions === nothing || extid.id in loadable_extensions)
+            blocker = subpackage_inflight_sibling(extid.id)
+            if blocker !== nothing
+                # go back to sleep until the sibling has finished loading
+                extid.ntriggers += 1
+                push!(get!(Vector{ExtensionId}, EXT_DORMITORY, blocker), extid)
+                continue
+            end
             push!(extids_to_load, extid)
         end
     end
@@ -2128,6 +2245,16 @@ function __require_subpackage(into::Module, parent::Symbol, sub::Symbol)
                                  the [subpackages] section of $parent's Project.toml, or its \
                                  source file is missing."))
         end
+        declared, project_file = subpackage_declared(PkgId(into), parentid, String(sub), env)
+        if !declared
+            throw(ArgumentError("""
+                Cannot load subpackage $parent::$sub into module $into: it is not declared in \
+                the [subdeps] section of $(something(project_file, "the project")). Add:
+
+                    [subdeps]
+                    $parent = ["$sub"]
+                """))
+        end
         if _track_dependencies[]
             # Record the parent too: the cache-file check resolves each requirement by
             # name from `into`, which works for the parent; the subpackage is then
@@ -2153,6 +2280,56 @@ would for a package. A stand-in for dedicated syntax.
 !!! warning
     Prototype. The interface may change or go away.
 """
+# Is the module identified by `where` allowed to load subpackage `sub` of `parent`
+# explicitly? It must be declared in the [subdeps] section of a project file:
+#
+#     [subdeps]
+#     Parent = ["Sub", "Other"]
+#
+#   - the parent itself, its extensions and its subpackages need no declaration;
+#   - a package uses its own Project.toml, an extension or subpackage of another package
+#     uses that package's Project.toml;
+#   - top-level code (`Main`, scripts) uses the project of the environment that provides
+#     the parent, unless that project is the parent itself; implicit (directory)
+#     environments have no project file and are not checked.
+#
+# Autoloaded subpackages are not loaded through here and need no declaration.
+# Returns whether it is allowed, and the project file that was consulted.
+function subpackage_declared(where::PkgId, parent::PkgId, sub::String, env::Union{Nothing, String})
+    where == parent && return true, nothing
+    where.uuid !== nothing && where.uuid == uuid5(parent.uuid::UUID, where.name) && return true, nothing
+    if where.uuid === nothing
+        env === nothing && return true, nothing
+        project_file = env_project_file(env)
+        project_file isa String || return true, nothing
+    else
+        specenv = locate_package_env(where)
+        specenv === nothing && return false, nothing
+        project_file = package_root_project_file_for_entry(specenv[1].path)
+        project_file === nothing && return false, nothing
+    end
+    d = parsed_toml(project_file)
+    # developing the parent: the active project is the parent itself
+    get(d, "uuid", nothing) == string(parent.uuid) && return true, nothing
+    subdeps = get(d, "subdeps", nothing)::Union{Nothing, Dict{String, Any}}
+    subdeps === nothing && return false, project_file
+    declared = get(subdeps, parent.name, nothing)
+    declared isa String && return declared == sub, project_file
+    declared isa Vector && return sub in declared, project_file
+    return false, project_file
+end
+
+# Like `package_root_project_file`, but also for extensions and subpackages in a
+# directory of their own (`ext/Foo/Foo.jl`, `sub/Foo/Foo.jl`)
+function package_root_project_file_for_entry(entry_path::String)::Union{Nothing, String}
+    dir = dirname(entry_path)
+    if basename(dirname(dir)) in ("ext", "sub")
+        dir = dirname(dir)
+    end
+    project_file = locate_project_file(normpath(dir, ".."))
+    return project_file isa String ? project_file : nothing
+end
+
 # `@subpackage using P::S` in module `modkey` records both `modkey => P` and `modkey => S` in
 # the cache file. `S` is not a name `modkey` can resolve by itself, but its identity is
 # derived from `P`, whose own mapping is checked by name.
@@ -2160,7 +2337,10 @@ function is_required_subpackage(requires::Vector{Pair{PkgId, PkgId}}, modkey::Pk
     req_modkey.uuid === nothing && return false
     for (modkey′, parent) in requires
         (modkey′ == modkey && parent.uuid !== nothing) || continue
-        uuid5(parent.uuid::UUID, req_modkey.name) == req_modkey.uuid && return true
+        if uuid5(parent.uuid::UUID, req_modkey.name) == req_modkey.uuid
+            # ...and `modkey` must still declare it, as for a dependency removed from [deps]
+            return @lock require_lock subpackage_declared(modkey, parent, req_modkey.name, nothing)[1]
+        end
     end
     return false
 end
