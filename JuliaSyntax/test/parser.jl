@@ -857,6 +857,14 @@ tests = [
         ((v=v"1.5",), "import A as B") =>  "(import (error (as (importpath A) B)))"
         "using A as B"     =>  "(using (error (as (importpath A) B)))"
         "using A, B as C"  =>  "(using (importpath A) (error (as (importpath B) C)))"
+        # Subpackages (1.15+)
+        ((v=v"1.15",), "using A::B")       => "(using (:: (importpath A) B))"
+        ((v=v"1.15",), "import A::B")      => "(import (:: (importpath A) B))"
+        ((v=v"1.15",), "using A::B, C")    => "(using (:: (importpath A) B) (importpath C))"
+        ((v=v"1.15",), "import A::B as C") => "(import (as (:: (importpath A) B) C))"
+        ((v=v"1.15",), "using A::B: x, y") => "(using (: (:: (importpath A) B) (importpath x) (importpath y)))"
+        ((v=v"1.15",), "using A:: B")      => "(using (:: (importpath A) (error)))"
+        ((v=v"1.14",), "using A::B")       => "(using (importpath A))"
         # parse_import_path
         # When parsing import we must split initial dots into nontrivial
         # leading dots for relative paths
