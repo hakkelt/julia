@@ -948,7 +948,8 @@ end
 #
 # A subpackage is a module that ships inside a package, shares that package's version
 # and compat, gets its own precompile cache file, and is only loaded when requested
-# explicitly (`Base.@subpackage using Parent::Sub`). It is declared in the parent's
+# explicitly (`using Parent::Sub` from syntax edition 1.15, or
+# `Base.@subpackage using Parent::Sub`). It is declared in the parent's
 # Project.toml:
 #
 #     [subpackages]
@@ -962,8 +963,13 @@ end
 # The identity of a subpackage is `PkgId(uuid5(parent_uuid, name), name)`, the same scheme
 # as for extensions. A subpackage may load the parent, any of the parent's [deps], and the
 # weakdeps and sibling subpackages that it lists. Unlike the parent's [deps], weakdeps
-# are not installed by default: Pkg would install them only when a subpackage that needs
-# them is selected. That part is not prototyped here.
+# are not installed by default: Pkg installs them only when a subpackage that needs them
+# is selected through the [subdeps] section of a project.
+#
+# Pkg copies the [subpackages] and [subdeps] sections into the package's manifest entry
+# (see `manifest_entry_subpackage_dict`), and the loader reads them from there. The
+# parent's Project.toml is read only when the parent is the active project or lives in an
+# implicit (directory) environment.
 
 function subpackage_deps(d::Dict{String, Any}, name::String)::Union{Nothing, Vector{String}}
     subs = get(d, "subpackages", nothing)::Union{Nothing, Dict{String, Any}}
@@ -1034,16 +1040,71 @@ function package_subpackage_get(project_file::String, where::PkgId, name::String
     return subpackage_dep_get(d, parent, where, name)
 end
 
-# the parent of `where` is the manifest entry `entry` (for package `parent`)
-function manifest_entry_subpackage_dep_get(manifest_file::String, parent::PkgId, entry::Dict{String, Any},
+# the parent of `where` is the manifest entry `entry` (for package `parent`) in manifest `d`
+function manifest_entry_subpackage_dep_get(d::Dict{String, Any}, parent::PkgId, entry::Dict{String, Any},
                                            where::PkgId, name::String)::Union{Nothing, PkgId}
-    parent_load_spec = explicit_manifest_entry_load_spec(manifest_file, parent, entry)
-    parent_load_spec isa PkgLoadSpec || return nothing
-    parent_project = package_root_project_file(parent_load_spec.path)
-    parent_project === nothing && return nothing
-    d = parsed_toml(parent_project)
-    is_subpackage_of(d, parent.uuid::UUID, where) || return nothing
-    return subpackage_dep_get(d, parent, where, name)
+    sd = manifest_entry_subpackage_dict(d, entry)
+    sd === nothing && return nothing
+    is_subpackage_of(sd, parent.uuid::UUID, where) || return nothing
+    return subpackage_dep_get(sd, parent, where, name)
+end
+
+# Pkg records the subpackages of a package in its manifest entry, as it does for extensions:
+#
+#     [[deps.Solvers]]
+#     deps = ["Core"]
+#     weakdeps = ["Heavy"]
+#     [deps.Solvers.subpackages]          # copied from the package's [subpackages]
+#     BDF = ["Heavy"]
+#     [deps.Solvers.subdeps]              # copied from the package's [subdeps]
+#
+# Return a dict shaped like a parsed Project.toml (`subpackages`, and `deps` and
+# `weakdeps` as name => uuid), which the functions working on a parent's Project.toml
+# accept. `nothing` when the entry has no subpackages.
+function manifest_entry_subpackage_dict(d::Dict{String, Any}, entry::Dict{String, Any})::Union{Nothing, Dict{String, Any}}
+    subs = get(entry, "subpackages", nothing)
+    subs isa Dict{String, Any} || return nothing
+    return Dict{String, Any}(
+        "subpackages" => subs,
+        "deps" => manifest_expand_deps(d, get(entry, "deps", nothing)),
+        "weakdeps" => manifest_expand_deps(d, get(entry, "weakdeps", nothing)))
+end
+
+# a manifest entry's `deps` (or `weakdeps`), as name => uuid
+function manifest_expand_deps(d::Dict{String, Any}, deps)::Dict{String, Any}
+    deps isa Dict{String, Any} && return deps
+    expanded = Dict{String, Any}()
+    deps isa Vector || return expanded
+    for name in deps
+        entries = get(d, name::String, nothing)::Union{Nothing, Vector{Any}}
+        # a weakdep that is not installed has no entry
+        (entries === nothing || length(entries) != 1) && continue
+        uuid = get(first(entries)::Dict{String, Any}, "uuid", nothing)::Union{Nothing, String}
+        uuid === nothing || (expanded[name] = uuid)
+    end
+    return expanded
+end
+
+# The manifest entry in `d` of package `pkg`, or of the package that `pkg` is an extension
+# or subpackage of, with that package's id
+function manifest_owner_entry(d::Dict{String, Any}, pkg::PkgId)::Union{Nothing, Tuple{PkgId, Dict{String, Any}}}
+    pkg.uuid === nothing && return nothing
+    for (name, entries) in d
+        for entry in entries::Vector{Any}
+            entry = entry::Dict{String, Any}
+            uuid = get(entry, "uuid", nothing)::Union{Nothing, String}
+            uuid === nothing && continue
+            id = PkgId(UUID(uuid), name)
+            id == pkg && return id, entry
+            for key in ("extensions", "subpackages")
+                children = get(entry, key, nothing)
+                if children isa Dict{String, Any} && haskey(children, pkg.name) && uuid5(id.uuid, pkg.name) == pkg.uuid
+                    return id, entry
+                end
+            end
+        end
+    end
+    return nothing
 end
 
 # find project file's top-level UUID entry (or nothing)
@@ -1326,15 +1387,16 @@ function explicit_manifest_deps_get(project_file::String, where::PkgId, name::St
     end
 
     # `where` is not a package or an extension in this environment. It may be a subpackage of
-    # one: the manifest does not record subpackages (yet), so find the parent by its UUID.
-    # This is a second pass so that ordinary lookups do not pay for the `uuid5` hashing.
+    # one, which its manifest entry lists. This is a second pass so that ordinary lookups do
+    # not pay for it.
     for (dep_name, entries) in d
         for entry in entries::Vector{Any}
             entry = entry::Dict{String, Any}
+            subs = get(entry, "subpackages", nothing)
+            (subs isa Dict{String, Any} && haskey(subs, where.name)) || continue
             uuid = get(entry, "uuid", nothing)::Union{String, Nothing}
             uuid === nothing && continue
-            uuid5(UUID(uuid), where.name) == where.uuid || continue
-            dep = manifest_entry_subpackage_dep_get(manifest_file, PkgId(UUID(uuid), dep_name), entry, where, name)
+            dep = manifest_entry_subpackage_dep_get(d, PkgId(UUID(uuid), dep_name), entry, where, name)
             dep === nothing || return dep
         end
     end
@@ -1379,21 +1441,21 @@ function explicit_manifest_uuid_load_spec(project_file::String, pkg::PkgId)::Uni
             end
         end
     end
-    # Subpackages: the manifest does not record them (yet), so find the parent by its UUID
-    # and look in its Project.toml
+    # Subpackages, which the manifest entry of their parent lists
     for (name, entries) in d
         entries = entries::Vector{Any}
         for entry in entries
             entry = entry::Dict{String, Any}
+            subs = get(entry, "subpackages", nothing)
+            (subs isa Dict{String, Any} && haskey(subs, pkg.name)) || continue
             uuid = get(entry, "uuid", nothing)::Union{Nothing, String}
-            uuid === nothing && continue
-            uuid5(UUID(uuid), pkg.name) == pkg.uuid || continue
+            (uuid !== nothing && uuid5(UUID(uuid), pkg.name) == pkg.uuid) || continue
             parent_load_spec = explicit_manifest_entry_load_spec(manifest_file, PkgId(UUID(uuid), name), entry)
-            parent_load_spec isa PkgLoadSpec || continue
-            parent_project = package_root_project_file(parent_load_spec.path)
-            parent_project === nothing && continue
-            is_subpackage_of(parsed_toml(parent_project), UUID(uuid), pkg) || continue
-            return PkgLoadSpec(find_subpkg_path(dirname(parent_project), pkg.name), parent_load_spec.julia_edition)
+            if !(parent_load_spec isa PkgLoadSpec)
+                error("failed to find source of parent package: \"$name\"")
+            end
+            p = normpath(dirname(parent_load_spec.path), "..")
+            return PkgLoadSpec(find_subpkg_path(p, pkg.name), parent_load_spec.julia_edition)
         end
     end
     return nothing
@@ -2052,17 +2114,37 @@ function subpackage_autoload_triggers(d::Dict{String, Any}, name::String)::Union
     return nothing
 end
 
+# The subpackage definitions of package `pkg` in environment `env`, as a dict shaped like a
+# parsed Project.toml: from the manifest entry of `pkg`, or from the Project.toml of `pkg`
+# itself when it is the active project or lives in an implicit environment.
+function package_subpackage_dict(env::String, pkg::PkgId)::Union{Nothing, Dict{String, Any}}
+    pkg.uuid === nothing && return nothing
+    project_file = env_project_file(env)
+    if project_file isa String
+        project_file_name_uuid(project_file, pkg.name) == pkg && return parsed_toml(project_file)
+        manifest_file = project_file_manifest_path(project_file)
+        manifest_file === nothing && return nothing
+        d = get_deps(parsed_toml(manifest_file))
+        for entry in get(Vector{Any}, d, pkg.name)::Vector{Any}
+            entry = entry::Dict{String, Any}
+            get(entry, "uuid", nothing) == string(pkg.uuid) || continue
+            return manifest_entry_subpackage_dict(d, entry)
+        end
+        return nothing
+    elseif project_file
+        _, implicit_project_file = entry_point_and_project_file(env, pkg.name)
+        implicit_project_file isa String || return nothing
+        project_file_name_uuid(implicit_project_file, pkg.name) == pkg || return nothing
+        return parsed_toml(implicit_project_file)
+    end
+    return nothing
+end
+
 function insert_subpackage_triggers(env::String, pkg::PkgId)
-    pkg.uuid === nothing && return
-    spec = manifest_uuid_load_spec(env, pkg)
-    spec isa PkgLoadSpec || return
-    project_file = package_root_project_file(spec.path)
-    project_file === nothing && return
-    d = parsed_toml(project_file)
+    d = package_subpackage_dict(env, pkg)
+    d === nothing && return
     subs = get(d, "subpackages", nothing)::Union{Nothing, Dict{String, Any}}
     subs === nothing && return
-    # `pkg` could itself be a subpackage, living in `sub/` of the project we just found
-    project_file_name_uuid(project_file, pkg.name) == pkg || return
     totaldeps = merge(get(Dict{String, Any}, d, "weakdeps")::Dict{String, Any},
                       get(Dict{String, Any}, d, "deps")::Dict{String, Any})
     autoloads = Dict{String, Any}()
@@ -2242,14 +2324,20 @@ function __require_subpackage(into::Module, parent::Symbol, sub::Symbol)
         subid = PkgId(uuid5(parentid.uuid::UUID, String(sub)), String(sub))
         if locate_package_env(subid, env) === nothing
             throw(ArgumentError("Package $parent has no subpackage $sub: it is not listed in \
-                                 the [subpackages] section of $parent's Project.toml, or its \
-                                 source file is missing."))
+                                 the [subpackages] section of $parent's Project.toml (as recorded \
+                                 in the manifest, so re-resolve after adding it), or its source \
+                                 file is missing."))
         end
         declared, project_file = subpackage_declared(PkgId(into), parentid, String(sub), env)
         if !declared
+            where = something(project_file, "the project")
+            if project_file !== nothing && basename(project_file) in manifest_names
+                where = "$(PkgId(into).name)'s Project.toml (as recorded in $project_file, \
+                         so re-resolve after changing it)"
+            end
             throw(ArgumentError("""
                 Cannot load subpackage $parent::$sub into module $into: it is not declared in \
-                the [subdeps] section of $(something(project_file, "the project")). Add:
+                the [subdeps] section of $where. Add:
 
                     [subdeps]
                     $parent = ["$sub"]
@@ -2275,7 +2363,9 @@ end
 
 Load subpackage `Sub` of package `Parent` and bind it to the name `Sub` in the current
 module. The `using` form also brings `Sub`'s exported names into scope, as `using Sub`
-would for a package. A stand-in for dedicated syntax.
+would for a package. Equivalent to `using Parent::Sub` and `import Parent::Sub`, which
+need syntax version 1.15 (see [Subpackages](@ref man-subpackages)); in older syntax
+versions, `using A::B` parses as a type assertion on `using A`.
 
 !!! warning
     Prototype. The interface may change or go away.
@@ -2302,13 +2392,13 @@ function subpackage_declared(where::PkgId, parent::PkgId, sub::String, env::Unio
         env === nothing && return true, nothing
         project_file = env_project_file(env)
         project_file isa String || return true, nothing
+        d = parsed_toml(project_file)
     else
         specenv = locate_package_env(where)
         specenv === nothing && return false, nothing
-        project_file = package_root_project_file_for_entry(specenv[1].path)
-        project_file === nothing && return false, nothing
+        d, project_file = package_subdeps_source(specenv[2], where, specenv[1].path)
+        d === nothing && return false, nothing
     end
-    d = parsed_toml(project_file)
     # developing the parent: the active project is the parent itself
     get(d, "uuid", nothing) == string(parent.uuid) && return true, nothing
     subdeps = get(d, "subdeps", nothing)::Union{Nothing, Dict{String, Any}}
@@ -2317,6 +2407,26 @@ function subpackage_declared(where::PkgId, parent::PkgId, sub::String, env::Unio
     declared isa String && return declared == sub, project_file
     declared isa Vector && return sub in declared, project_file
     return false, project_file
+end
+
+# Where the [subdeps] of package `where` (or of the package that `where` is an extension or
+# subpackage of) are recorded in environment `env`: the manifest entry of that package, or its
+# Project.toml when it is the active project or lives in an implicit environment. Returns the
+# dict holding a `subdeps` key and the file it was read from.
+function package_subdeps_source(env::String, where::PkgId, entry_path::String)
+    project_file = env_project_file(env)
+    if project_file isa String
+        d = parsed_toml(project_file)
+        get(d, "uuid", nothing) == string(where.uuid) && return d, project_file
+        manifest_file = project_file_manifest_path(project_file)
+        if manifest_file !== nothing
+            owner = manifest_owner_entry(get_deps(parsed_toml(manifest_file)), where)
+            owner === nothing || return owner[2], manifest_file
+        end
+    end
+    project_file = package_root_project_file_for_entry(entry_path)
+    project_file === nothing && return nothing, nothing
+    return parsed_toml(project_file), project_file
 end
 
 # Like `package_root_project_file`, but also for extensions and subpackages in a
@@ -2347,9 +2457,16 @@ end
 
 macro subpackage(ex)
     usage = "expected `@subpackage using Parent::Sub` or `@subpackage import Parent::Sub`"
-    # `using A::B` parses as `(using A)::B`
-    (ex isa Expr && ex.head === :(::) && length(ex.args) == 2) || throw(ArgumentError(usage))
-    stmt, sub = ex.args
+    if ex isa Expr && (ex.head === :using || ex.head === :import) && length(ex.args) == 1 &&
+            Meta.isexpr(ex.args[1], :(::), 2)
+        # from syntax version 1.15, `using A::B` parses as `using (A::B)`
+        stmt = Expr(ex.head, ex.args[1].args[1])
+        sub = ex.args[1].args[2]
+    else
+        # before, as `(using A)::B`
+        (ex isa Expr && ex.head === :(::) && length(ex.args) == 2) || throw(ArgumentError(usage))
+        stmt, sub = ex.args
+    end
     (stmt isa Expr && (stmt.head === :using || stmt.head === :import) && length(stmt.args) == 1 && sub isa Symbol) ||
         throw(ArgumentError(usage))
     path = stmt.args[1]
