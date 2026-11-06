@@ -632,6 +632,11 @@ function pkgdir(m::Module, paths::String...)
     elseif basename(path) == "ext"
         # extension source in `../ext/FooExt/FooExt.jl`
         path = dirname(path)
+    elseif base == "sub"
+        # subpackage source in `../sub/Foo.jl`
+    elseif basename(path) == "sub"
+        # subpackage source in `../sub/Foo/Foo.jl`
+        path = dirname(path)
     else
         # not a recognized package layout, e.g. a bare `Foo.jl` in a load path entry
         return nothing
@@ -860,6 +865,11 @@ function environment_deps_get(env::String, where::Union{Nothing,PkgId}, name::St
     pkg = package_extension_get(project_file, where, name)
     pkg === nothing || return pkg
 
+    # Are we a subpackage of the project? If so, we get I, II and the weakdeps and
+    # sibling subpackages listed for `where` in the `subpackages` section.
+    pkg = package_subpackage_get(project_file, where, name)
+    pkg === nothing || return pkg
+
     if implicit_manifest
         # With an implicit manifest, getting here means that our (implicit) environment
         # *has* the package `where`. If we don't find it, it just means that `where` doesn't
@@ -881,6 +891,8 @@ function manifest_uuid_load_spec(env::String, pkg::PkgId)::Union{Nothing,PkgLoad
         end
         mby_ext = project_file_ext_load_spec(project_file, pkg)
         mby_ext === nothing || return mby_ext
+        mby_sub = project_file_subpkg_load_spec(project_file, pkg)
+        mby_sub === nothing || return mby_sub
         # look for manifest file and `where` stanza
         return explicit_manifest_uuid_load_spec(project_file, pkg)
     elseif project_file
@@ -930,6 +942,106 @@ function project_file_ext_load_spec(project_file::String, ext::PkgId)
         end
     end
     return nothing
+end
+
+## Subpackages (prototype) ##
+#
+# A subpackage is a module that ships inside a package, shares that package's version
+# and compat, gets its own precompile cache file, and is only loaded when requested
+# explicitly (`Base.@subpackage using Parent::Sub`). It is declared in the parent's
+# Project.toml:
+#
+#     [subpackages]
+#     Common = []                       # code in sub/Common.jl or sub/Common/Common.jl
+#     Tsit5 = ["Common"]                # may depend on sibling subpackages...
+#     Plots = ["Common", "Makie"]       # ...and on [weakdeps] of the parent
+#
+# An entry may also be a table, `Tsit5 = { deps = ["Common"] }`, leaving room for more keys.
+# The identity of a subpackage is `PkgId(uuid5(parent_uuid, name), name)`, the same scheme
+# as for extensions. A subpackage may load the parent, any of the parent's [deps], and the
+# weakdeps and sibling subpackages that it lists. Unlike the parent's [deps], weakdeps
+# are not installed by default: Pkg would install them only when a subpackage that needs
+# them is selected. That part is not prototyped here.
+
+function subpackage_deps(d::Dict{String, Any}, name::String)::Union{Nothing, Vector{String}}
+    subs = get(d, "subpackages", nothing)::Union{Nothing, Dict{String, Any}}
+    subs === nothing && return nothing
+    entry = get(subs, name, nothing)
+    entry === nothing && return nothing
+    if entry isa Dict{String, Any}
+        entry = get(entry, "deps", String[])
+    end
+    entry isa String && return String[entry]
+    return String[x::String for x in entry::Vector]
+end
+
+# (the cheap dictionary lookup goes first, so packages without subpackages never hash)
+is_subpackage_of(d::Dict{String, Any}, parent_uuid::UUID, sub::PkgId) =
+    subpackage_deps(d, sub.name) !== nothing && sub.uuid == uuid5(parent_uuid, sub.name)
+
+function find_subpkg_path(project_path::String, name::String)
+    subfiledir = joinpath(project_path, "sub", name, name * ".jl")
+    isfile(subfiledir) && return subfiledir
+    return joinpath(project_path, "sub", name * ".jl")
+end
+
+# The Project.toml at the root of the package whose entry point is `entry_path` (`src/Pkg.jl`)
+function package_root_project_file(entry_path::String)::Union{Nothing, String}
+    project_file = locate_project_file(normpath(dirname(entry_path), ".."))
+    return project_file isa String ? project_file : nothing
+end
+
+# `where` is a subpackage of `parent`, whose (parsed) project file is `d`: what does `name` mean in it?
+function subpackage_dep_get(d::Dict{String, Any}, parent::PkgId, where::PkgId, name::String)::PkgId
+    name == parent.name && return parent
+    pdeps = get(d, "deps", nothing)::Union{Nothing, Dict{String, Any}}
+    if pdeps !== nothing
+        uuid = get(pdeps, name, nothing)::Union{Nothing, String}
+        uuid === nothing || return PkgId(UUID(uuid), name)
+    end
+    if name in something(subpackage_deps(d, where.name))
+        # a sibling subpackage...
+        subpackage_deps(d, name) === nothing || return PkgId(uuid5(parent.uuid::UUID, name), name)
+        # ...or a weak dependency of the parent
+        wdeps = get(d, "weakdeps", nothing)::Union{Nothing, Dict{String, Any}}
+        if wdeps !== nothing
+            uuid = get(wdeps, name, nothing)::Union{Nothing, String}
+            uuid === nothing || return PkgId(UUID(uuid), name)
+        end
+    end
+    # sentinel: we found `where`, but `name` is not one of its dependencies
+    return PkgId(name)
+end
+
+# the active project is the parent of subpackage `pkg`
+function project_file_subpkg_load_spec(project_file::String, pkg::PkgId)
+    d = parsed_toml(project_file)
+    uuid = get(d, "uuid", nothing)::Union{Nothing, String}
+    uuid === nothing && return nothing
+    is_subpackage_of(d, UUID(uuid), pkg) || return nothing
+    return PkgLoadSpec(find_subpkg_path(dirname(project_file), pkg.name), project_get_edition(d))
+end
+
+# the active project is the parent of subpackage `where`
+function package_subpackage_get(project_file::String, where::PkgId, name::String)
+    d = parsed_toml(project_file)
+    uuid = get(d, "uuid", nothing)::Union{Nothing, String}
+    uuid === nothing && return nothing
+    is_subpackage_of(d, UUID(uuid), where) || return nothing
+    parent = PkgId(UUID(uuid), get(d, "name", "")::String)
+    return subpackage_dep_get(d, parent, where, name)
+end
+
+# the parent of `where` is the manifest entry `entry` (for package `parent`)
+function manifest_entry_subpackage_dep_get(manifest_file::String, parent::PkgId, entry::Dict{String, Any},
+                                           where::PkgId, name::String)::Union{Nothing, PkgId}
+    parent_load_spec = explicit_manifest_entry_load_spec(manifest_file, parent, entry)
+    parent_load_spec isa PkgLoadSpec || return nothing
+    parent_project = package_root_project_file(parent_load_spec.path)
+    parent_project === nothing && return nothing
+    d = parsed_toml(parent_project)
+    is_subpackage_of(d, parent.uuid::UUID, where) || return nothing
+    return subpackage_dep_get(d, parent, where, name)
 end
 
 # find project file's top-level UUID entry (or nothing)
@@ -1211,8 +1323,22 @@ function explicit_manifest_deps_get(project_file::String, where::PkgId, name::St
         end
     end
 
-    # We did not find `where` in this environment, either as a package or as an extension.
-    # The caller should continue searching the environment stack.
+    # `where` is not a package or an extension in this environment. It may be a subpackage of
+    # one: the manifest does not record subpackages (yet), so find the parent by its UUID.
+    # This is a second pass so that ordinary lookups do not pay for the `uuid5` hashing.
+    for (dep_name, entries) in d
+        for entry in entries::Vector{Any}
+            entry = entry::Dict{String, Any}
+            uuid = get(entry, "uuid", nothing)::Union{String, Nothing}
+            uuid === nothing && continue
+            uuid5(UUID(uuid), where.name) == where.uuid || continue
+            dep = manifest_entry_subpackage_dep_get(manifest_file, PkgId(UUID(uuid), dep_name), entry, where, name)
+            dep === nothing || return dep
+        end
+    end
+
+    # We did not find `where` in this environment, either as a package, an extension or
+    # a subpackage. The caller should continue searching the environment stack.
     return nothing
 end
 
@@ -1249,6 +1375,23 @@ function explicit_manifest_uuid_load_spec(project_file::String, pkg::PkgId)::Uni
                 p = normpath(dirname(parent_path), "..")
                 return PkgLoadSpec(find_ext_path(p, pkg.name), parent_load_spec.julia_edition)
             end
+        end
+    end
+    # Subpackages: the manifest does not record them (yet), so find the parent by its UUID
+    # and look in its Project.toml
+    for (name, entries) in d
+        entries = entries::Vector{Any}
+        for entry in entries
+            entry = entry::Dict{String, Any}
+            uuid = get(entry, "uuid", nothing)::Union{Nothing, String}
+            uuid === nothing && continue
+            uuid5(UUID(uuid), pkg.name) == pkg.uuid || continue
+            parent_load_spec = explicit_manifest_entry_load_spec(manifest_file, PkgId(UUID(uuid), name), entry)
+            parent_load_spec isa PkgLoadSpec || continue
+            parent_project = package_root_project_file(parent_load_spec.path)
+            parent_project === nothing && continue
+            is_subpackage_of(parsed_toml(parent_project), UUID(uuid), pkg) || continue
+            return PkgLoadSpec(find_subpkg_path(dirname(parent_project), pkg.name), parent_load_spec.julia_edition)
         end
     end
     return nothing
@@ -1948,6 +2091,96 @@ function get_extension(parentid::PkgId, ext::Symbol)
     parentid.uuid === nothing && return nothing
     extid = PkgId(uuid5(parentid.uuid, string(ext)), string(ext))
     return maybe_root_module(extid)
+end
+
+"""
+    Base.require_subpackage(into::Module, parent::Symbol, sub::Symbol)::Module
+
+Load subpackage `sub` of package `parent`, resolving `parent` the way `import parent`
+in module `into` would, and return its module. `sub` must be listed in the
+`[subpackages]` section of `parent`'s Project.toml. Usually called through
+[`Base.@subpackage`](@ref).
+
+!!! warning
+    Prototype. The interface may change or go away.
+"""
+function require_subpackage(into::Module, parent::Symbol, sub::Symbol)
+    world = _require_world_age[]
+    if world == typemax(UInt)
+        world = get_world_counter()
+    end
+    return invoke_in_world(world, __require_subpackage, into, parent, sub)
+end
+
+function __require_subpackage(into::Module, parent::Symbol, sub::Symbol)
+    @lock require_lock begin
+    LOADING_CACHE[] = LoadingCache()
+    try
+        parentenv = identify_package_env(into, String(parent))
+        if parentenv === nothing || parentenv[1].uuid === nothing
+            throw(ArgumentError("Cannot load subpackage $parent::$sub into module $into: package $parent \
+                                 not found in the dependencies of $into."))
+        end
+        parentid, env = parentenv
+        subid = PkgId(uuid5(parentid.uuid::UUID, String(sub)), String(sub))
+        if locate_package_env(subid, env) === nothing
+            throw(ArgumentError("Package $parent has no subpackage $sub: it is not listed in \
+                                 the [subpackages] section of $parent's Project.toml, or its \
+                                 source file is missing."))
+        end
+        if _track_dependencies[]
+            # Record the parent too: the cache-file check resolves each requirement by
+            # name from `into`, which works for the parent; the subpackage is then
+            # accepted because its identity derives from the parent (`is_required_subpackage`)
+            push!(_require_dependencies, (into, binpack(parentid), UInt64(0), UInt32(0), 0.0))
+            push!(_require_dependencies, (into, binpack(subid), UInt64(0), UInt32(0), 0.0))
+        end
+        return _require_prelocked(subid, env)
+    finally
+        LOADING_CACHE[] = nothing
+    end
+    end
+end
+
+"""
+    Base.@subpackage using Parent::Sub
+    Base.@subpackage import Parent::Sub
+
+Load subpackage `Sub` of package `Parent` and bind it to the name `Sub` in the current
+module. The `using` form also brings `Sub`'s exported names into scope, as `using Sub`
+would for a package. A stand-in for dedicated syntax.
+
+!!! warning
+    Prototype. The interface may change or go away.
+"""
+# `@subpackage using P::S` in module `modkey` records both `modkey => P` and `modkey => S` in
+# the cache file. `S` is not a name `modkey` can resolve by itself, but its identity is
+# derived from `P`, whose own mapping is checked by name.
+function is_required_subpackage(requires::Vector{Pair{PkgId, PkgId}}, modkey::PkgId, req_modkey::PkgId)
+    req_modkey.uuid === nothing && return false
+    for (modkey′, parent) in requires
+        (modkey′ == modkey && parent.uuid !== nothing) || continue
+        uuid5(parent.uuid::UUID, req_modkey.name) == req_modkey.uuid && return true
+    end
+    return false
+end
+
+macro subpackage(ex)
+    usage = "expected `@subpackage using Parent::Sub` or `@subpackage import Parent::Sub`"
+    # `using A::B` parses as `(using A)::B`
+    (ex isa Expr && ex.head === :(::) && length(ex.args) == 2) || throw(ArgumentError(usage))
+    stmt, sub = ex.args
+    (stmt isa Expr && (stmt.head === :using || stmt.head === :import) && length(stmt.args) == 1 && sub isa Symbol) ||
+        throw(ArgumentError(usage))
+    path = stmt.args[1]
+    (path isa Expr && path.head === :. && length(path.args) == 1 && path.args[1] isa Symbol) ||
+        throw(ArgumentError(usage))
+    parent = path.args[1]::Symbol
+    load = Expr(:call, GlobalRef(Base, :require_subpackage), __module__, QuoteNode(parent), QuoteNode(sub))
+    ret = Expr(:toplevel, Expr(:const, Expr(:(=), sub, load)))
+    stmt.head === :using && push!(ret.args, Expr(:using, Expr(:., :., sub)))
+    push!(ret.args, nothing)
+    return esc(ret)
 end
 
 # End extensions
@@ -5113,7 +5346,7 @@ end
             for (modkey, req_modkey) in requires
                 # verify that `require(modkey, name(req_modkey))` ==> `req_modkey`
                 pkg = identify_package(modkey, req_modkey.name)
-                if pkg != req_modkey
+                if pkg != req_modkey && !is_required_subpackage(requires, modkey, req_modkey)
                     @debug "Rejecting cache file $cachefile because uuid mapping for $modkey => $req_modkey has changed, expected $modkey => $(repr(MIME"text/plain"(), pkg))"
                     record_reason(reasons, :dep_identity_changed)
                     return true
