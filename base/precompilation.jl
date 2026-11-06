@@ -558,6 +558,8 @@ struct ExplicitEnv
                                       String,   # `path` entry
                                       Nothing,  # stdlib (no `path` nor `git-tree-sha1`)
                                       Missing}} # not present in the manifest
+    # Subpackages in use (`subpackages` entries that Pkg records in Manifest.toml)
+    subpackages::Dict{UUID, Vector{String}}
     #prefs::Union{Nothing, Dict{String, Any}}
     #local_prefs::Union{Nothing, Dict{String, Any}}
 end
@@ -574,7 +576,8 @@ function ExplicitEnv(::Nothing, envpath::String="")
         Dict{UUID, Vector{UUID}}(),   # weakdeps
         Dict{UUID, Dict{String, Vector{UUID}}}(), # extensions
         Dict{UUID, String}(),     # names
-        Dict{UUID, Union{SHA1, String, Nothing, Missing}}())
+        Dict{UUID, Union{SHA1, String, Nothing, Missing}}(), # lookup_strategy
+        Dict{UUID, Vector{String}}()) # subpackages
 end
 function ExplicitEnv(envpath::String)
     # Handle missing project file by creating an empty environment
@@ -654,6 +657,7 @@ function ExplicitEnv(envpath::String)
     extensions = Dict{UUID, Dict{String, Vector{String}}}()
     name_to_uuid = Dict{String, UUID}()
     lookup_strategy = Dict{UUID, Union{SHA1, String, Nothing, Missing}}()
+    subpackages = Dict{UUID, Vector{String}}()
 
     sizehint!(deps, length(manifest_d))
     sizehint!(weakdeps, length(manifest_d))
@@ -705,6 +709,12 @@ function ExplicitEnv(envpath::String)
                 deps_pkg_concrete[ext] = triggers
             end
             extensions[m_uuid] = deps_pkg_concrete
+
+            # Subpackages in use
+            subs = get(pkg_info, "subpackages", nothing)
+            if subs isa Vector && !isempty(subs)
+                subpackages[m_uuid] = String[x::String for x in subs]
+            end
 
             # Determine strategy to find package
             lookup_strat = begin
@@ -804,7 +814,7 @@ function ExplicitEnv(envpath::String)
     return ExplicitEnv(envpath, project_deps, project_weakdeps, project_extras,
                        project_extensions, workspace_deps,
                        deps_expanded, weakdeps_expanded, extensions_expanded,
-                       names, lookup_strategy, #=prefs, local_prefs=#)
+                       names, lookup_strategy, subpackages #=prefs, local_prefs=#)
 end
 
 function collect_workspace_deps(project_file::String)
@@ -1017,6 +1027,41 @@ end
 
 # Build dependency graph from an ExplicitEnv.
 # Returns a NamedTuple of (direct_deps, ext_to_parent, parent_to_exts, triggers, project_deps, serial_deps).
+# Add nodes for the subpackages `selected` of `pkg` and for the sibling subpackages they need.
+# A subpackage may load the parent, the parent's deps and the weakdeps and siblings it lists
+# (from the parent's Project.toml).
+function add_subpackage_nodes!(direct_deps::Dict{PkgId, Vector{PkgId}}, parent_to_subs::Dict{PkgId, Vector{PkgId}},
+                               pkg::PkgId, selected::Vector{String}, pkg_uuids::Set{UUID})
+    path = Base.locate_package(pkg)
+    path === nothing && return
+    project_file = Base.package_root_project_file(path)
+    project_file === nothing && return
+    d = Base.parsed_toml(project_file)
+    names = Set{String}(selected)
+    for sub in selected
+        union!(names, Base.subpackage_sibling_closure(d, sub))
+    end
+    weakdeps = get(Dict{String, Any}, d, "weakdeps")::Dict{String, Any}
+    subs = PkgId[]
+    for name in names
+        sub_deps = Base.subpackage_deps(d, name)
+        sub_deps === nothing && continue
+        sub = PkgId(Base.uuid5(pkg.uuid::UUID, name), name)
+        deps = PkgId[pkg; direct_deps[pkg]]
+        for dep in sub_deps
+            if Base.subpackage_deps(d, dep) !== nothing
+                push!(deps, PkgId(Base.uuid5(pkg.uuid::UUID, dep), dep))
+            elseif (uuid = get(weakdeps, dep, nothing)) !== nothing && UUID(uuid::String) in pkg_uuids
+                push!(deps, PkgId(UUID(uuid::String), dep))
+            end
+        end
+        direct_deps[sub] = filter!(!Base.in_sysimage, unique!(deps))
+        push!(subs, sub)
+    end
+    isempty(subs) || (parent_to_subs[pkg] = subs)
+    return
+end
+
 function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, requested_pkgids::Vector{PkgId})
     direct_deps = Dict{PkgId, Vector{PkgId}}()
     parent_to_exts = Dict{PkgId, Vector{PkgId}}()
@@ -1030,6 +1075,14 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
     pkg_uuids = Set{UUID}()
     for uuid in root_uuids
         _collect_reachable!(pkg_uuids, env.deps, uuid)
+    end
+    # The weak dependencies of a package with subpackages in use are in the manifest only
+    # if one of those needs them; nothing lists them in `deps`
+    for uuid in collect(pkg_uuids)
+        haskey(env.subpackages, uuid) || continue
+        for weak in get(Vector{UUID}, env.weakdeps, uuid)
+            haskey(env.deps, weak) && _collect_reachable!(pkg_uuids, env.deps, weak)
+        end
     end
 
     for dep in pkg_uuids
@@ -1063,6 +1116,15 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
         end
     end
 
+    # Subpackages in use get a node each, as do the sibling subpackages they need
+    parent_to_subs = Dict{PkgId, Vector{PkgId}}()
+    for dep in pkg_uuids
+        haskey(env.subpackages, dep) || continue
+        pkg = PkgId(dep, env.names[dep])
+        haskey(direct_deps, pkg) || continue
+        add_subpackage_nodes!(direct_deps, parent_to_subs, pkg, env.subpackages[dep], pkg_uuids)
+    end
+
     project_deps = PkgId[]
     if manifest
         for (uuid, name) in env.workspace_deps
@@ -1076,6 +1138,25 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
     filter!(!Base.in_sysimage, project_deps)
     # consider exts of project deps to be project deps so that errors are reported
     append!(project_deps, keys(filter(d -> last(d) in project_deps, ext_to_parent)))
+    # ... and their subpackages in use too
+    for (parent, subs) in parent_to_subs
+        parent in project_deps && append!(project_deps, subs)
+    end
+
+    # A package that depends on the parent may load its subpackages, so it waits for them.
+    # Not the packages that the subpackages themselves need, which would be a cycle.
+    for (parent, subs) in parent_to_subs
+        needed_by_subs = Set{PkgId}()
+        for sub in subs
+            visit_indirect_deps!(direct_deps, Set{PkgId}(), sub, needed_by_subs)
+        end
+        for (pkg, deps) in direct_deps
+            (pkg in subs || pkg in needed_by_subs || !(parent in deps)) && continue
+            for sub in subs
+                sub in deps || push!(deps, sub)
+            end
+        end
+    end
 
     # An extension effectively depends on another extension if it has a strict superset of its triggers
     for ext_a in keys(ext_to_parent)
