@@ -11,6 +11,10 @@ end
 
 function eval_import_path(at::Module, from::Union{Module, Nothing}, path::Expr, keyword::String)
     isempty(path.args) && error("malformed import statement")
+    if path.head === :(::)
+        from === nothing || error("invalid $keyword path: a subpackage `Parent::Sub` cannot follow `:`")
+        return eval_subpackage_path(at, path, keyword), nothing
+    end
 
     i = RefValue(1)
     function next!()
@@ -53,6 +57,18 @@ function eval_import_path(at::Module, from::Union{Module, Nothing}, path::Expr, 
         v = next!()
     end
     m, v
+end
+
+# `Parent::Sub` (syntax edition 1.15 and later): load subpackage `Sub` of package `Parent`
+function eval_subpackage_path(at::Module, path::Expr, keyword::String)
+    length(path.args) == 2 || error("malformed $keyword statement")
+    parent, sub = path.args
+    if !(parent isa Expr && parent.head === :. && length(parent.args) == 1 &&
+         (parent.args[1] isa Symbol) && parent.args[1] !== :. && sub isa Symbol)
+        error("invalid $keyword path: a subpackage must be named as `Package::Subpackage`, \
+               where `Package` is a top-level package")
+    end
+    return require_subpackage(at, parent.args[1]::Symbol, sub)
 end
 
 function eval_import_path_all(at::Module, path::Expr, keyword::String)
@@ -135,7 +151,7 @@ See also [`_using`](@ref Core._using).
 function _eval_using(to::Module, path::Expr, flags::UInt8=UInt8(0))
     from = eval_import_path_all(to, path, "using")
     Core._using(to, from, flags)
-    is_package = length(path.args) == 1 && path.args[1] !== :.
+    is_package = path.head === :(::) || (length(path.args) == 1 && path.args[1] !== :.)
     if to == Main && is_package
         Core._import(to, from, nameof(from))
     end

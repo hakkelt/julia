@@ -1817,6 +1817,151 @@ pkgimage(val) = val == 1 ? `--pkgimages=yes` : `--pkgimages=no`
 opt_level(val) = `-O$val`
 debug_level(val) = `-g$val`
 inline(val) = val == 1 ? `--inline=yes` : `--inline=no`
+@testset "Subpackages" begin
+    solvers_uuid = UUID("11111111-1111-1111-1111-111111111111")
+    subid(name) = PkgId(Base.uuid5(solvers_uuid, name), name)
+    # Run `code` in a new process with the given environment of a fresh copy of the fixtures
+    # and a fresh depot, after applying `edit!` to the copy. Returns its stdout, its stdout
+    # and stderr together, and whether it succeeded.
+    function run_subpkg(code::String, envname::String = "env"; edit! = identity, depot = mkdepottempdir())
+        mktempdir() do dir
+            fixtures = joinpath(dir, "Subpackages")
+            cp(joinpath(@__DIR__, "project", "Subpackages"), fixtures)
+            chmod(fixtures, 0o755; recursive = true)
+            edit!(fixtures)
+            cmd = `$(Base.julia_cmd()) --startup-file=no --project=$(joinpath(fixtures, envname)) -e $code`
+            cmd = addenv(cmd, "JULIA_DEPOT_PATH" => depot * pathsep, "JULIA_LOAD_PATH" => nothing)
+            out, err = IOBuffer(), IOBuffer()
+            ok = success(pipeline(cmd; stdout = out, stderr = err))
+            # stdout for the results; stderr has precompilation messages and errors
+            o = replace(String(take!(out)), fixtures => "<fixtures>")
+            e = replace(String(take!(err)), fixtures => "<fixtures>")
+            return o, o * e, ok
+        end
+    end
+    pathsep = Sys.iswindows() ? ";" : ":"
+    replace_line(file, pat, new) = write(file, join(map(l -> occursin(pat, l) ? new : l, readlines(file)), "\n"))
+    delete_lines(file, pat) = write(file, join(filter(l -> !occursin(pat, l), readlines(file)), "\n"))
+
+    @testset "explicit loading" begin
+        out, outerr, ok = run_subpkg("""
+            Base.@subpackage using Solvers::Tsit5
+            print(Tsit5.solve(Tsit5Alg()), "|", isdefined(Tsit5, :Common), "|")
+            print(haskey(Base.loaded_modules, Base.PkgId(Base.UUID(\"$(solvers_uuid)\"), "Solvers")), "|")
+            id = Base.PkgId(Tsit5)
+            print(id.uuid == Base.uuid5(Base.UUID(\"$(solvers_uuid)\"), "Tsit5"), "|", pkgversion(Tsit5), "|")
+            print(Base.isprecompiled(id), "|")
+            Base.@subpackage using Solvers::BDF
+            print(BDF.solve(BDFAlg()))
+            """)
+        @test ok
+        @test out == "tsit5 via light|true|false|true|1.2.3|true|bdf via heavy, parent loaded: true"
+    end
+
+    @testset "`using Parent::Sub` syntax (edition 1.15)" begin
+        # a package with `[syntax] julia_version = "1.15"`
+        out, outerr, ok = run_subpkg("using SyntaxApp; print(SyntaxApp.run(), \"|\", SyntaxApp.common_name())")
+        @test ok
+        @test out == "tsit5 via light|Common"
+        # top-level code with the 1.15 parser; the name is bound in `Main`, as for `using A`
+        out, outerr, ok = run_subpkg("""
+            Base.Experimental.@set_syntax_version v"1.15"
+            include_string(Main, "using Solvers::Tsit5; print(Tsit5.solve(Tsit5Alg()), isdefined(Main, :Tsit5))")
+            """)
+        @test ok
+        @test out == "tsit5 via lighttrue"
+        # a subpackage path must name a top-level package
+        out, outerr, ok = run_subpkg("Core.eval(Main, Expr(:using, Expr(:(::), Expr(:., :., :Solvers), :Tsit5)))")
+        @test !ok
+        @test occursin("a subpackage must be named as `Package::Subpackage`", outerr)
+    end
+    # Before 1.15, `using A::B` is a type assertion on the `using` statement
+    @test Meta.parse("using A::B") == Expr(:(::), Expr(:using, Expr(:., :A)), :B)
+    @test Base.JuliaSyntax.parsestmt(Expr, "using A::B: f"; version = v"1.15") ==
+        Expr(:using, Expr(:(:), Expr(:(::), Expr(:., :A), :B), Expr(:., :f)))
+    @test Base.JuliaSyntax.parsestmt(Expr, "import A::B as C"; version = v"1.15") ==
+        Expr(:import, Expr(:as, Expr(:(::), Expr(:., :A), :B), :C))
+
+    @testset "downstream packages and precompilation" begin
+        depot = mkdepottempdir()
+        out, outerr, ok = run_subpkg("using App; print(App.run(), \"|\", Base.isprecompiled(Base.PkgId(App)))"; depot)
+        @test ok
+        @test endswith(out, "tsit5 via light|true")
+        # the cache files are reused in a new session
+        out, outerr, ok = run_subpkg("using App; print(App.run())"; depot)
+        @test ok
+        @test out == "tsit5 via light"
+    end
+
+    @testset "the manifest records the subpackages" begin
+        # the parent's Project.toml is not consulted: the manifest entry's definitions win
+        out, outerr, ok = run_subpkg("""
+            Base.@subpackage using Solvers::Tsit5
+            try; Base.require(Tsit5, :Heavy); catch e; print(sprint(showerror, e)); end
+            """; edit! = d -> replace_line(joinpath(d, "Solvers", "Project.toml"), r"^Tsit5 = ", "Tsit5 = [\"Common\", \"Heavy\"]"))
+        @test ok
+        @test occursin("does not have Heavy in its dependencies", outerr)
+        out, outerr, ok = run_subpkg("Base.@subpackage using Solvers::Tsit5";
+                             edit! = d -> delete_lines(joinpath(d, "env", "Manifest.toml"), r"^\s*Tsit5 = "))
+        @test !ok
+        @test occursin("Package Solvers has no subpackage Tsit5", outerr)
+        # developing the parent: the active project is the parent, whose Project.toml is read
+        out, outerr, ok = run_subpkg("Base.@subpackage using Solvers::Tsit5; print(Tsit5.solve(Tsit5Alg()))", "Solvers")
+        @test ok
+        @test out == "tsit5 via light"
+    end
+
+    @testset "[subdeps]" begin
+        out, outerr, ok = run_subpkg("using Solvers; Base.@subpackage using Solvers::Tsit5", "env_nodecl")
+        @test !ok
+        @test occursin("it is not declared in the [subdeps] section of <fixtures>/env_nodecl/Project.toml", outerr)
+        out, outerr, ok = run_subpkg("using App"; edit! = d -> delete_lines(joinpath(d, "env", "Manifest.toml"), r"deps\.App\.subdeps|^\s*Solvers = \[\"Tsit5\"\]"))
+        @test !ok
+        @test occursin("Cannot load subpackage Solvers::Tsit5 into module App: it is not declared in the [subdeps] section of App's Project.toml", outerr)
+        # loading an undeclared weak dependency
+        out, outerr, ok = run_subpkg("Base.@subpackage using Solvers::Common";
+                             edit! = d -> write(joinpath(d, "Solvers", "sub", "Common.jl"), "module Common\nusing Heavy\nend\n"))
+        @test !ok
+        @test occursin("does not have Heavy in its dependencies", outerr)
+    end
+
+    @testset "autoload" begin
+        out, outerr, ok = run_subpkg("""
+            using Solvers, Heavy
+            issub(n) = Base.get_extension(Solvers, n) !== nothing
+            print(issub(:Plots), issub(:Recipes), issub(:Lazy), "|", isdefined(Main, :plotit), "|")
+            print(Base.get_extension(Solvers, :Plots).plotit())
+            """)
+        @test ok
+        @test out == "truetruetrue|false|plot of bdf via heavy, parent loaded: true"
+        out, outerr, ok = run_subpkg("""
+            using Solvers
+            issub(n) = Base.get_extension(Solvers, n) !== nothing
+            print(issub(:Lazy))
+            using Helper
+            print(issub(:Lazy), issub(:Recipes))
+            """)
+        @test ok
+        @test out == "falsetruefalse"
+        out, outerr, ok = run_subpkg("using Solvers; print(Solvers.parent_loaded())";
+                             edit! = d -> replace_line(joinpath(d, "env", "Manifest.toml"), r"^\s*Lazy = ", "Lazy = { deps = [\"Helper\"], autoload = \"yes\" }"))
+        @test ok
+        @test occursin("Ignoring `autoload` for subpackage Lazy", outerr)
+        @test endswith(out, "true")
+    end
+
+    @testset "macro" begin
+        @test_throws ArgumentError macroexpand(@__MODULE__, :(Base.@subpackage using Solvers))
+        @test_throws ArgumentError macroexpand(@__MODULE__, :(Base.@subpackage f(x)::T))
+        # the same expansion for the parse of `using A::B` before and after syntax version 1.15
+        old = macroexpand(@__MODULE__, Expr(:macrocall, GlobalRef(Base, Symbol("@subpackage")), LineNumberNode(1),
+                                            Expr(:(::), Expr(:using, Expr(:., :Solvers)), :Tsit5)))
+        new = macroexpand(@__MODULE__, Expr(:macrocall, GlobalRef(Base, Symbol("@subpackage")), LineNumberNode(1),
+                                            Expr(:using, Expr(:(::), Expr(:., :Solvers), :Tsit5))))
+        @test old == new
+    end
+end
+
 check_bounds(val) = if val == 0
     `--check-bounds=auto`
 elseif val == 1

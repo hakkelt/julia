@@ -2686,6 +2686,21 @@ end
 function parse_import(ps::ParseState, word, has_import_prefix)
     mark = position(ps)
     parse_import_path(ps)
+    if peek(ps) == K"::" && !preceding_whitespace(peek_token(ps)) && ps.stream.version >= (1, 15)
+        # Subpackages. Before 1.15, `using A::B` parses as a type assertion on
+        # the whole statement, `(::-i (using (importpath A)) B)`.
+        # using A::B       ==>  (using (:: (importpath A) B))
+        # import A::B as C ==>  (import (as (:: (importpath A) B) C))
+        # using A::B: x    ==>  (using (: (:: (importpath A) B) (importpath x)))
+        bump(ps, TRIVIA_FLAG)
+        if peek(ps) == K"Identifier" && !preceding_whitespace(peek_token(ps))
+            bump(ps)
+        else
+            # using A:: B  ==>  (using (:: (importpath A) (error)))
+            bump_invisible(ps, K"error", error="expected a subpackage name directly after `::`")
+        end
+        emit(ps, mark, K"::")
+    end
     # import A: x, y   ==>  (import (: (importpath A) (importpath x) (importpath y)))
     if peek(ps) == K"as"
         # import A as B     ==>  (import (as (importpath A) B))

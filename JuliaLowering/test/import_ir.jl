@@ -51,6 +51,40 @@ using A.B.C: b, c.d as e
 3   (return core.nothing)
 
 ########################################
+# Subpackages (syntax version 1.15+)
+using A::B, C
+#---------------------
+1   (call JuliaLowering.eval_using TestMod (inert (:: (. A) B)))
+2   latestworld
+3   (call JuliaLowering.eval_using TestMod (inert (. C)))
+4   latestworld
+5   (return core.nothing)
+
+########################################
+# Subpackage with `as`
+import A::B as C
+#---------------------
+1   (call JuliaLowering.eval_import true TestMod core.nothing (inert (as (:: (. A) B) C)))
+2   latestworld
+3   (return core.nothing)
+
+########################################
+# Subpackage before `:`
+using A::B: f, g as h
+#---------------------
+1   (call JuliaLowering.eval_import false TestMod (inert (:: (. A) B)) (inert (. f)) (inert (as (. g) h)))
+2   latestworld
+3   (return core.nothing)
+
+########################################
+# Error: subpackage after `:`
+using A: B::C
+#---------------------
+LoweringError:
+using A: B::C
+#       └───┘ ── a subpackage `Parent::Sub` cannot follow `:`
+
+########################################
 # Error: Import not at top level
 function f()
     import A: b

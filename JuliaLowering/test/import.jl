@@ -337,3 +337,35 @@ end
         """); true)
     end
 end
+
+# Subpackages: `using Parent::Sub` (syntax version 1.15+) needs Base support and the
+# fixture packages of Julia's own tests, so it only runs in the Julia source tree
+const subpackage_fixtures = joinpath(@__DIR__, "..", "..", "test", "project", "Subpackages")
+if isdefined(Base, :require_subpackage) && isdir(subpackage_fixtures)
+@testset "subpackages" begin
+    mktempdir() do dir
+        fixtures = joinpath(dir, "Subpackages")
+        cp(subpackage_fixtures, fixtures)
+        code = """
+        using JuliaLowering
+        JuliaLowering.activate!()
+        Base.Experimental.@set_syntax_version v"1.15"
+        include_string(Main, "using Solvers::Tsit5; print(Tsit5.solve(Tsit5Alg()), '|')")
+        include_string(Main, "import Solvers::Common as C; print(nameof(C), '|')")
+        include_string(Main, "using Solvers::BDF: BDFAlg; print(BDFAlg, '|')")
+        Core.eval(Main, Expr(:import, Expr(:as, Expr(:(::), Expr(:., :Solvers), :Tsit5), :T2)))
+        print(T2 === Tsit5, '|')
+        try
+            include_string(Main, "using .Solvers::Tsit5")
+        catch e
+            print(occursin("a subpackage must be named as `Package::Subpackage`", sprint(showerror, e)))
+        end
+        """
+        load_path = join(["@", dirname(dirname(pathof(JuliaLowering))), "@stdlib"], Sys.iswindows() ? ";" : ":")
+        cmd = addenv(`$(Base.julia_cmd()) --startup-file=no --project=$(joinpath(fixtures, "env")) -e $code`,
+                     "JULIA_LOAD_PATH" => load_path,
+                     "JULIA_DEPOT_PATH" => joinpath(dir, "depot") * (Sys.iswindows() ? ";" : ":"))
+        @test read(cmd, String) == "tsit5 via light|Common|BDFAlg|true|true"
+    end
+end
+end
