@@ -759,9 +759,9 @@ function ExplicitEnv(envpath::String)
         deps_expanded[proj_uuid] = filter!(!=(proj_uuid), collect(values(project_deps)))
         extensions_expanded[proj_uuid] = project_extensions
         if get(project_d, "subpackages", nothing) isa Dict{String, Any}
-            # a package's own environment uses all of its subpackages
+            # the project is not in the manifest: its subpackages are defined, and their
+            # weak dependencies listed, in its own project file
             subpackage_defs[proj_uuid] = project_d
-            subpackages[proj_uuid] = collect(String, keys(project_d["subpackages"]::Dict{String, Any}))
             weakdeps_expanded[proj_uuid] = collect(values(project_weakdeps))
         end
         path = get(project_d, "path", nothing)::Union{String, Nothing}
@@ -806,6 +806,29 @@ function ExplicitEnv(envpath::String)
             exts_expanded[ext] = triggers_expanded
         end
         extensions_expanded[pkg] = exts_expanded
+    end
+
+    # The other projects in the workspace select subpackages in their [subdeps] too. A
+    # package's own environment, where it is the active project or a member of the
+    # workspace, uses all of its subpackages (see `Base.environment_subpackage_selection`).
+    for file in Base.workspace_project_files(envpath)
+        member_d = parsed_toml(file)
+        member_subdeps = get(member_d, "subdeps", nothing)
+        if file != envpath && member_subdeps isa Dict{String, Any}
+            member_deps = merge(get(Dict{String, Any}, member_d, "deps")::Dict{String, Any},
+                                get(Dict{String, Any}, member_d, "weakdeps")::Dict{String, Any})
+            push!(subdeps_requests, (member_subdeps, member_deps))
+        end
+        member_subs = get(member_d, "subpackages", nothing)
+        member_uuid = get(member_d, "uuid", nothing)
+        (member_subs isa Dict{String, Any} && member_uuid isa String) || continue
+        member_uuid = UUID(member_uuid)
+        # a member that something in the workspace depends on is in the manifest too
+        get!(subpackage_defs, member_uuid, member_d)
+        selected = get!(Vector{String}, subpackages, member_uuid)
+        for sub in keys(member_subs)
+            sub in selected || push!(selected, sub)
+        end
     end
 
     for (subdeps_d, dep_uuids) in subdeps_requests

@@ -1993,6 +1993,35 @@ inline(val) = val == 1 ? `--inline=yes` : `--inline=no`
         @test out == "falsefalsetrue"
     end
 
+    @testset "a parent in a workspace" begin
+        # the workspace of the parent is its own environment: all its subpackages are in
+        # use, also when another member is the active project
+        function make_workspace(d)
+            write(joinpath(d, "Project.toml"), "[workspace]\nprojects = [\"Solvers\", \"docs\"]\n")
+            mkpath(joinpath(d, "docs"))
+            write(joinpath(d, "docs", "Project.toml"), """
+                [deps]
+                Solvers = "$solvers_uuid"
+                Heavy = "33333333-3333-3333-3333-333333333333"
+                Helper = "55555555-5555-5555-5555-555555555555"
+                """)
+            write(joinpath(d, "Manifest.toml"), replace(read(joinpath(d, "env", "Manifest.toml"), String), "path = \"../" => "path = \""))
+            rm(joinpath(d, "Solvers", "Manifest.toml"))
+        end
+        names = ("Common", "Tsit5", "BDF", "Plots", "Recipes", "Lazy")
+        out, outerr, ok = run_subpkg("""
+            Base.Precompilation.precompilepkgs(; io = devnull)
+            u = Base.UUID("$solvers_uuid")
+            print(join([Base.isprecompiled(Base.PkgId(Base.uuid5(u, n), n)) for n in $names], ","), "|")
+            using Solvers, Heavy, Helper
+            print(join([Base.get_extension(Solvers, Symbol(n)) !== nothing for n in ("Plots", "Recipes", "Lazy")], ","), "|")
+            Base.@subpackage using Solvers::Tsit5
+            print(Tsit5.solve(Tsit5Alg()))
+            """, "docs"; edit! = make_workspace)
+        @test ok
+        @test out == "true,true,true,true,true,true|true,true,true|tsit5 via light"
+    end
+
     @testset "macro" begin
         @test_throws ArgumentError macroexpand(@__MODULE__, :(Base.@subpackage using Solvers))
         @test_throws ArgumentError macroexpand(@__MODULE__, :(Base.@subpackage f(x)::T))

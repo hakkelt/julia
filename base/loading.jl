@@ -2443,8 +2443,8 @@ end
 #   - a package uses its own Project.toml, an extension or subpackage of another package
 #     uses that package's Project.toml;
 #   - top-level code (`Main`, scripts) uses the project of the environment that provides
-#     the parent, unless that project is the parent itself; implicit (directory)
-#     environments have no project file and are not checked.
+#     the parent, unless that project or another member of its workspace is the parent
+#     itself; implicit (directory) environments have no project file and are not checked.
 #
 # Autoloaded subpackages are not loaded through here and need no declaration.
 # Returns whether it is allowed, and the project file that was consulted.
@@ -2456,6 +2456,10 @@ function subpackage_declared(where::PkgId, parent::PkgId, sub::String, env::Unio
         project_file = env_project_file(env)
         project_file isa String || return true, nothing
         d = parsed_toml(project_file)
+        # the workspace of the parent is its own environment, which uses all its subpackages
+        for file in workspace_project_files(project_file)
+            get(parsed_toml(file), "uuid", nothing) == string(parent.uuid) && return true, nothing
+        end
     else
         specenv = locate_package_env(where)
         specenv === nothing && return false, nothing
