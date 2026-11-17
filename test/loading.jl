@@ -1845,28 +1845,28 @@ inline(val) = val == 1 ? `--inline=yes` : `--inline=no`
 
     @testset "explicit loading" begin
         out, outerr, ok = run_subpkg("""
-            Base.@subpackage using Solvers::Tsit5
+            using Solvers::Tsit5
             print(Tsit5.solve(Tsit5Alg()), "|", isdefined(Tsit5, :Common), "|")
             print(haskey(Base.loaded_modules, Base.PkgId(Base.UUID(\"$(solvers_uuid)\"), "Solvers")), "|")
             id = Base.PkgId(Tsit5)
             print(id.uuid == Base.uuid5(Base.UUID(\"$(solvers_uuid)\"), "Tsit5"), "|", pkgversion(Tsit5), "|")
             print(Base.isprecompiled(id), "|")
-            Base.@subpackage using Solvers::BDF
+            using Solvers::BDF
             print(BDF.solve(BDFAlg()))
             """)
         @test ok
         @test out == "tsit5 via light|true|false|true|1.2.3|true|bdf via heavy, parent loaded: true"
     end
 
-    @testset "`using Parent::Sub` syntax (edition 1.15)" begin
+    @testset "`using Parent::Sub` syntax" begin
         # a package with `[syntax] julia_version = "1.15"`
         out, outerr, ok = run_subpkg("using SyntaxApp; print(SyntaxApp.run(), \"|\", SyntaxApp.common_name())")
         @test ok
         @test out == "tsit5 via light|Common"
-        # top-level code with the 1.15 parser; the name is bound in `Main`, as for `using A`
+        # top-level code in an environment without a syntax version; the name is bound in
+        # `Main`, as for `using A`
         out, outerr, ok = run_subpkg("""
-            Base.Experimental.@set_syntax_version v"1.15"
-            include_string(Main, "using Solvers::Tsit5; print(Tsit5.solve(Tsit5Alg()), isdefined(Main, :Tsit5))")
+            using Solvers::Tsit5; print(Tsit5.solve(Tsit5Alg()), isdefined(Main, :Tsit5))
             """)
         @test ok
         @test out == "tsit5 via lighttrue"
@@ -1875,31 +1875,34 @@ inline(val) = val == 1 ? `--inline=yes` : `--inline=no`
         @test !ok
         @test occursin("a subpackage must be named as `Package::Subpackage`", outerr)
     end
-    # Before 1.15, `using A::B` is a type assertion on the `using` statement
-    @test Meta.parse("using A::B") == Expr(:(::), Expr(:using, Expr(:., :A)), :B)
-    @test Base.JuliaSyntax.parsestmt(Expr, "using A::B: f"; version = v"1.15") ==
+    # `using A::B` names a subpackage in every syntax version; with whitespace around `::`,
+    # it is a type assertion on the `using` statement
+    for v in (v"1.10", v"1.15")
+        @test Base.JuliaSyntax.parsestmt(Expr, "using A::B"; version = v) == Expr(:using, Expr(:(::), Expr(:., :A), :B))
+    end
+    @test Meta.parse("using A :: B") == Expr(:(::), Expr(:using, Expr(:., :A)), :B)
+    @test Meta.parse("using A::B: f") ==
         Expr(:using, Expr(:(:), Expr(:(::), Expr(:., :A), :B), Expr(:., :f)))
-    @test Base.JuliaSyntax.parsestmt(Expr, "import A::B as C"; version = v"1.15") ==
+    @test Meta.parse("import A::B as C") ==
         Expr(:import, Expr(:as, Expr(:(::), Expr(:., :A), :B), :C))
-    @test Base.JuliaSyntax.parsestmt(Expr, "using A, A::{B, C}"; version = v"1.15") ==
+    @test Meta.parse("using A, A::{B, C}") ==
         Expr(:using, Expr(:., :A), Expr(:(::), Expr(:., :A), Expr(:braces, :B, :C)))
     @testset "several subpackages, `using Parent::{A, B}`" begin
         out, outerr, ok = run_subpkg("""
-            Base.Experimental.@set_syntax_version v"1.15"
-            include_string(Main, "using Solvers, Solvers::{Tsit5, BDF}")
+            using Solvers, Solvers::{Tsit5, BDF}
             print(Tsit5.solve(Tsit5Alg()), "|", BDF.solve(BDFAlg()), "|", isdefined(Main, :Solvers))
             """)
         @test ok
         @test out == "tsit5 via light|bdf via heavy, parent loaded: true|true"
         out, outerr, ok = run_subpkg("""
-            Base.@subpackage using Solvers, Solvers::{Tsit5, Common}
-            print(Tsit5.solve(Tsit5Alg()), "|", nameof(Common), "|", isdefined(Main, :Solvers))
+            import Solvers::{Tsit5, Common}
+            print(nameof(Tsit5), "|", nameof(Common), "|", isdefined(Main, :Solvers), isdefined(Main, :Tsit5Alg))
             """)
         @test ok
-        @test out == "tsit5 via light|Common|true"
+        @test out == "Tsit5|Common|falsefalse"
         # not with `as` or before `:`
         for code in ("import Solvers::{Tsit5, BDF} as T", "using Solvers::{Tsit5, BDF}: solve")
-            ex = Base.JuliaSyntax.parsestmt(Expr, code; version = v"1.15")
+            ex = Meta.parse(code)
             lowered = Meta.lower(@__MODULE__, ex)
             @test Meta.isexpr(lowered, :error) && occursin("several subpackages `Parent::{...}` cannot be", string(lowered.args[1]))
         end
@@ -1919,30 +1922,30 @@ inline(val) = val == 1 ? `--inline=yes` : `--inline=no`
     @testset "the manifest records the subpackages" begin
         # the parent's Project.toml is not consulted: the manifest entry's definitions win
         out, outerr, ok = run_subpkg("""
-            Base.@subpackage using Solvers::Tsit5
+            using Solvers::Tsit5
             try; Base.require(Tsit5, :Heavy); catch e; print(sprint(showerror, e)); end
             """; edit! = d -> replace_line(joinpath(d, "Solvers", "Project.toml"), r"^Tsit5 = ", "Tsit5 = [\"Common\", \"Heavy\"]"))
         @test ok
         @test occursin("does not have Heavy in its dependencies", outerr)
-        out, outerr, ok = run_subpkg("Base.@subpackage using Solvers::Tsit5";
+        out, outerr, ok = run_subpkg("using Solvers::Tsit5";
                              edit! = d -> delete_lines(joinpath(d, "env", "Manifest.toml"), r"^\s*Tsit5 = "))
         @test !ok
         @test occursin("Package Solvers has no subpackage Tsit5", outerr)
         # developing the parent: the active project is the parent, whose Project.toml is read
-        out, outerr, ok = run_subpkg("Base.@subpackage using Solvers::Tsit5; print(Tsit5.solve(Tsit5Alg()))", "Solvers")
+        out, outerr, ok = run_subpkg("using Solvers::Tsit5; print(Tsit5.solve(Tsit5Alg()))", "Solvers")
         @test ok
         @test out == "tsit5 via light"
     end
 
     @testset "[subdeps]" begin
-        out, outerr, ok = run_subpkg("using Solvers; Base.@subpackage using Solvers::Tsit5", "env_nodecl")
+        out, outerr, ok = run_subpkg("using Solvers; using Solvers::Tsit5", "env_nodecl")
         @test !ok
         @test occursin("it is not declared in the [subdeps] section of <fixtures>/env_nodecl/Project.toml", outerr)
         out, outerr, ok = run_subpkg("using App"; edit! = d -> delete_lines(joinpath(d, "env", "Manifest.toml"), r"deps\.App\.subdeps|^\s*Solvers = \[\"Tsit5\"\]"))
         @test !ok
         @test occursin("Cannot load subpackage Solvers::Tsit5 into module App: it is not declared in the [subdeps] section of App's Project.toml", outerr)
         # loading an undeclared weak dependency
-        out, outerr, ok = run_subpkg("Base.@subpackage using Solvers::Common";
+        out, outerr, ok = run_subpkg("using Solvers::Common";
                              edit! = d -> write(joinpath(d, "Solvers", "sub", "Common.jl"), "module Common\nusing Heavy\nend\n"))
         @test !ok
         @test occursin("does not have Heavy in its dependencies", outerr)
@@ -2015,31 +2018,11 @@ inline(val) = val == 1 ? `--inline=yes` : `--inline=no`
             print(join([Base.isprecompiled(Base.PkgId(Base.uuid5(u, n), n)) for n in $names], ","), "|")
             using Solvers, Heavy, Helper
             print(join([Base.get_extension(Solvers, Symbol(n)) !== nothing for n in ("Plots", "Recipes", "Lazy")], ","), "|")
-            Base.@subpackage using Solvers::Tsit5
+            using Solvers::Tsit5
             print(Tsit5.solve(Tsit5Alg()))
             """, "docs"; edit! = make_workspace)
         @test ok
         @test out == "true,true,true,true,true,true|true,true,true|tsit5 via light"
-    end
-
-    @testset "macro" begin
-        @test_throws ArgumentError macroexpand(@__MODULE__, :(Base.@subpackage using Solvers))
-        @test_throws ArgumentError macroexpand(@__MODULE__, :(Base.@subpackage f(x)::T))
-        # the same expansion for the parse of `using A::B` before and after syntax version 1.15
-        old = macroexpand(@__MODULE__, Expr(:macrocall, GlobalRef(Base, Symbol("@subpackage")), LineNumberNode(1),
-                                            Expr(:(::), Expr(:using, Expr(:., :Solvers)), :Tsit5)))
-        new = macroexpand(@__MODULE__, Expr(:macrocall, GlobalRef(Base, Symbol("@subpackage")), LineNumberNode(1),
-                                            Expr(:using, Expr(:(::), Expr(:., :Solvers), :Tsit5))))
-        @test old == new
-        # `Parent::{A, B}`, before and after syntax version 1.15
-        old = macroexpand(@__MODULE__, Expr(:macrocall, GlobalRef(Base, Symbol("@subpackage")), LineNumberNode(1),
-                                            Expr(:(::), Expr(:using, Expr(:., :Solvers), Expr(:., :Solvers)), Expr(:braces, :Tsit5, :BDF))))
-        new = macroexpand(@__MODULE__, Expr(:macrocall, GlobalRef(Base, Symbol("@subpackage")), LineNumberNode(1),
-                                            Expr(:using, Expr(:., :Solvers), Expr(:(::), Expr(:., :Solvers), Expr(:braces, :Tsit5, :BDF)))))
-        @test old == new
-        @test count(ex -> Meta.isexpr(ex, :const), new.args) == 2
-        @test_throws ArgumentError macroexpand(@__MODULE__, Expr(:macrocall, GlobalRef(Base, Symbol("@subpackage")), LineNumberNode(1),
-                                                                 Expr(:using, Expr(:(::), Expr(:., :Solvers), Expr(:braces)))))
     end
 end
 

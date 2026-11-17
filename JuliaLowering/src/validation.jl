@@ -444,7 +444,7 @@ vst1_importpath_nodots(vcx, st) = vst1_importpath(vcx, st; dots_ok=false)
 vst1_importpath_multi(vcx, st) = vst1_importpath(vcx, st; dots_ok=true, braces_ok=true)
 function vst1_importpath(vcx, st; dots_ok, braces_ok=false)
     ok = pass()
-    # A subpackage, `Parent::Sub` or `Parent::Sub as name` (syntax version 1.15+). That
+    # A subpackage, `Parent::Sub` or `Parent::Sub as name`. That
     # `Parent` names a top-level package is checked when the import is evaluated.
     sub = head(st) === :as && numchildren(st) == 2 ? st[1] : st
     if head(sub) === :(::)

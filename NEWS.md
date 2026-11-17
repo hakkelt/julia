@@ -5,9 +5,9 @@ New language features
 ---------------------
 
 * Packages can define subpackages: modules shipped inside a package that are precompiled and
-  loaded separately, on request, with `using Parent::Sub` or `using Parent::{Sub1, Sub2}`
-  (from syntax version 1.15) or `Base.@subpackage using Parent::Sub`. Packages that use one declare it in a `[subdeps]`
-  section of their project file (prototype; see the manual's code loading chapter).
+  loaded separately, on request, with `using Parent::Sub` or `using Parent::{Sub1, Sub2}`.
+  Packages that use one declare it in a `[subdeps]` section of their project file (prototype;
+  see the manual's code loading chapter).
 
 Language changes
 ----------------

@@ -59,7 +59,7 @@ function eval_import_path(at::Module, from::Union{Module, Nothing}, path::Expr, 
     m, v
 end
 
-# `Parent::Sub` (syntax edition 1.15 and later): load subpackage `Sub` of package `Parent`
+# `Parent::Sub`: load subpackage `Sub` of package `Parent`
 function eval_subpackage_path(at::Module, path::Expr, keyword::String)
     length(path.args) == 2 || error("malformed $keyword statement")
     parent, sub = path.args
@@ -103,6 +103,7 @@ form of `import`, `import ...:`, and `using ...:`.
 import A             => _eval_import(true,  Main, nothing,          Expr(:., :A))
 import A.b           => _eval_import(true,  Main, nothing,          Expr(:., :A, :b))
 import A.b as c      => _eval_import(true,  Main, nothing,          Expr(:as, Expr(:., :A, :b), :c))
+import A::B          => _eval_import(true,  Main, nothing,          Expr(:(::), Expr(:., :A), :B))
 import A.B: C.d, e   => _eval_import(true,  Main, Expr(:., :A, :B), Expr(:., :C, :d), Expr(:., :e))
 import A.B: C.d as e => _eval_import(true,  Main, Expr(:., :A, :B), Expr(:as, Expr(:., :C, :d), :e))
 using  A.B: C.d, e   => _eval_import(false, Main, Expr(:., :A, :B), Expr(:., :C, :d), Expr(:., :e))
@@ -120,7 +121,7 @@ function _eval_import(imported::Bool, to::Module, from::Union{Expr, Nothing}, pa
         asname = nothing
         if path.head === :as && length(path.args) == 2
             path, asname = path.args
-        elseif path.head !== :.
+        elseif path.head !== :. && path.head !== :(::)   # `A.b` or subpackage `Parent::Sub`
             fail()
         end
         m, name = eval_import_path(to, from, path, keyword)

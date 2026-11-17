@@ -548,7 +548,6 @@ Base.locate_package
 Base.compilecache
 Base.isprecompiled
 Base.get_extension
-Base.@subpackage
 Base.require_subpackage
 ```
 

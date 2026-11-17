@@ -948,8 +948,7 @@ end
 #
 # A subpackage is a module that ships inside a package, shares that package's version
 # and compat, gets its own precompile cache file, and is only loaded when requested
-# explicitly (`using Parent::Sub` from syntax edition 1.15, or
-# `Base.@subpackage using Parent::Sub`). It is declared in the parent's
+# explicitly, with `using Parent::Sub`. It is declared in the parent's
 # Project.toml:
 #
 #     [subpackages]
@@ -2081,7 +2080,7 @@ end
 #
 # The subpackage may still need dependencies that are not triggers; it loads them itself.
 # Autoloading only loads the module: names come into scope only with an explicit
-# `@subpackage using Parent::Sub`.
+# `using Parent::Sub`.
 function subpackage_autoload_triggers(d::Dict{String, Any}, name::String)::Union{Nothing, Vector{String}}
     subs = get(d, "subpackages", nothing)::Union{Nothing, Dict{String, Any}}
     subs === nothing && return nothing
@@ -2374,7 +2373,7 @@ end
 Load subpackage `sub` of package `parent`, resolving `parent` the way `import parent`
 in module `into` would, and return its module. `sub` must be listed in the
 `[subpackages]` section of `parent`'s Project.toml. Usually called through
-[`Base.@subpackage`](@ref).
+`using Parent::Sub` and `import Parent::Sub`.
 
 !!! warning
     Prototype. The interface may change or go away.
@@ -2507,7 +2506,7 @@ function package_root_project_file_for_entry(entry_path::String)::Union{Nothing,
     return project_file isa String ? project_file : nothing
 end
 
-# `@subpackage using P::S` in module `modkey` records both `modkey => P` and `modkey => S` in
+# `using P::S` in module `modkey` records both `modkey => P` and `modkey => S` in
 # the cache file. `S` is not a name `modkey` can resolve by itself, but its identity is
 # derived from `P`, whose own mapping is checked by name.
 function is_required_subpackage(requires::Vector{Pair{PkgId, PkgId}}, modkey::PkgId, req_modkey::PkgId)
@@ -2520,67 +2519,6 @@ function is_required_subpackage(requires::Vector{Pair{PkgId, PkgId}}, modkey::Pk
         end
     end
     return false
-end
-
-"""
-    Base.@subpackage using Parent::Sub
-    Base.@subpackage import Parent::Sub
-    Base.@subpackage using Parent::{Sub1, Sub2}
-    Base.@subpackage using Parent, Parent::{Sub1}
-
-Load subpackage `Sub` of package `Parent` and bind it to the name `Sub` in the current
-module. The `using` form also brings `Sub`'s exported names into scope, as `using Sub`
-would for a package. `Parent::{Sub1, Sub2}` loads several subpackages of the same
-package, and other packages may be listed in the same statement. Equivalent to the same
-statements without the macro, which need syntax version 1.15 (see
-[Subpackages](@ref man-subpackages)); in older syntax versions, `using A::B` parses as a
-type assertion on `using A`.
-
-!!! warning
-    Prototype. The interface may change or go away.
-"""
-macro subpackage(ex)
-    usage = "expected `@subpackage using Parent::Sub`, `@subpackage import Parent::Sub` or \
-             `@subpackage using Parent::{Sub1, Sub2}`"
-    (ex isa Expr && (ex.head === :using || ex.head === :import || ex.head === :(::))) ||
-        throw(ArgumentError(usage))
-    if ex.head === :(::)
-        # before syntax version 1.15, `using A, B::C` parses as `(using A, B)::C`
-        length(ex.args) == 2 || throw(ArgumentError(usage))
-        stmt, subs = ex.args
-        (stmt isa Expr && (stmt.head === :using || stmt.head === :import) && !isempty(stmt.args)) ||
-            throw(ArgumentError(usage))
-        paths = Any[stmt.args[1:end-1]..., Expr(:(::), stmt.args[end], subs)]
-        head = stmt.head
-    else
-        # from syntax version 1.15, as `using A, (B::C)`
-        paths = ex.args
-        head = ex.head
-    end
-    ret = Expr(:toplevel)
-    for path in paths
-        if Meta.isexpr(path, :(::), 2)
-            parentpath, subs = path.args
-            (parentpath isa Expr && parentpath.head === :. && length(parentpath.args) == 1 &&
-                parentpath.args[1] isa Symbol && parentpath.args[1] !== :.) || throw(ArgumentError(usage))
-            parent = parentpath.args[1]::Symbol
-            subs = Meta.isexpr(subs, :braces) ? subs.args : Any[subs]
-            (!isempty(subs) && all(x -> x isa Symbol, subs)) || throw(ArgumentError(usage))
-            for sub in subs
-                load = Expr(:call, GlobalRef(Base, :require_subpackage), __module__, QuoteNode(parent), QuoteNode(sub))
-                push!(ret.args, Expr(:const, Expr(:(=), sub, load)))
-                head === :using && push!(ret.args, Expr(:using, Expr(:., :., sub)))
-            end
-        elseif Meta.isexpr(path, :.)
-            # a package next to the subpackages, `@subpackage using Parent, Parent::Sub`
-            push!(ret.args, Expr(head, path))
-        else
-            throw(ArgumentError(usage))
-        end
-    end
-    any(p -> Meta.isexpr(p, :(::)), paths) || throw(ArgumentError(usage))
-    push!(ret.args, nothing)
-    return esc(ret)
 end
 
 # End extensions

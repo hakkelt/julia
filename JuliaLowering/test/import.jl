@@ -338,7 +338,7 @@ end
     end
 end
 
-# Subpackages: `using Parent::Sub` (syntax version 1.15+) needs Base support and the
+# Subpackages: `using Parent::Sub` needs Base support and the
 # fixture packages of Julia's own tests, so it only runs in the Julia source tree
 const subpackage_fixtures = joinpath(@__DIR__, "..", "..", "test", "project", "Subpackages")
 if isdefined(Base, :require_subpackage) && isdir(subpackage_fixtures)
@@ -349,7 +349,6 @@ if isdefined(Base, :require_subpackage) && isdir(subpackage_fixtures)
         code = """
         using JuliaLowering
         JuliaLowering.activate!()
-        Base.Experimental.@set_syntax_version v"1.15"
         include_string(Main, "using Solvers::Tsit5; print(Tsit5.solve(Tsit5Alg()), '|')")
         include_string(Main, "import Solvers::Common as C; print(nameof(C), '|')")
         include_string(Main, "using Solvers::BDF: BDFAlg; print(BDFAlg, '|')")

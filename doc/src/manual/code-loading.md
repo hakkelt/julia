@@ -434,11 +434,10 @@ entry point of subpackage `Tsit5` is `sub/Tsit5.jl` or `sub/Tsit5/Tsit5.jl`. A s
 identified by `PkgId(uuid5(parent_uuid, name), name)`, as an extension is.
 
 A subpackage is loaded with `using Parent::Sub` or `import Parent::Sub`, which also allow the
-usual forms `import Parent::Sub as S` and `using Parent::Sub: name`. This syntax is available
-from [syntax version](@ref syntax-versioning) 1.15. In code parsed with an older syntax
-version, `using A::B` is a type assertion on the `using` statement, and
-`Base.@subpackage using Parent::Sub` is the equivalent of `using Parent::Sub` and binds `Sub`
-in the current module. Several subpackages of the same package can be loaded at once with
+usual forms `import Parent::Sub as S` and `using Parent::Sub: name`, in every
+[syntax version](@ref syntax-versioning). As for `using Sub`, the name `Sub` is bound in the
+current module. (With whitespace around `::`, `using A :: B` is still a type assertion on the
+`using` statement.) Several subpackages of the same package can be loaded at once with
 `using Parent::{Sub1, Sub2}`, also next to the parent itself, as in
 `using Parent, Parent::{Sub1}`. This form cannot be renamed with `as` or precede `:`.
 Loading a subpackage does not bring the parent's exported names into scope.

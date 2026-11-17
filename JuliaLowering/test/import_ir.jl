@@ -51,7 +51,7 @@ using A.B.C: b, c.d as e
 3   (return core.nothing)
 
 ########################################
-# Subpackages (syntax version 1.15+)
+# Subpackages
 using A::B, C
 #---------------------
 1   (call JuliaLowering.eval_using TestMod (inert (:: (. A) B)))
