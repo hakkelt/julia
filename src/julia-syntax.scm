@@ -2688,11 +2688,37 @@
          (or (check-module-path e)
              (and (eq? (car e) 'as)
                   (check-module-path (cadr e)) (symbol? (caddr e))))))
+  ;; `Parent::{Sub1, Sub2}` names several subpackages; it cannot be renamed or precede `:`
+  (define (check-plain-path e)
+    (or (check-path e) (subpackage-braces-path? e)))
+  (if (and (list? e) (pair? (car e)) (eq? (caar e) ':)
+           (any subpackage-braces-path? (cdar e)))
+      (error (string "invalid \"" what "\" statement: several subpackages `Parent::{...}` cannot be combined with `:`")))
+  (if (and (list? e) (any (lambda (x) (and (pair? x) (eq? (car x) 'as)
+                                           (subpackage-braces-path? (cadr x))))
+                          e))
+      (error (string "invalid \"" what "\" statement: several subpackages `Parent::{...}` cannot be renamed with `as`")))
   (unless (and (list? e)
-               (or (every check-path e)
+               (or (every check-plain-path e)
                    (and (list? (car e)) (eq? (caar e) ':)
                         (every check-path (cdar e)))))
     (error (string "malformed \"" what "\" statement"))))
+
+;; (:: (. Parent) (braces Sub1 Sub2))
+(define (subpackage-braces-path? e)
+  (and (pair? e) (eq? (car e) '|::|) (length= e 3)
+       (pair? (cadr e)) (eq? (caadr e) '|.|) (every symbol? (cdadr e))
+       (pair? (caddr e)) (eq? (car (caddr e)) 'braces)
+       (pair? (cdr (caddr e))) (every symbol? (cdr (caddr e)))))
+
+;; Expand `Parent::{Sub1, Sub2}` in a list of import paths into `Parent::Sub1, Parent::Sub2`
+(define (expand-subpackage-braces paths)
+  (apply append
+         (map (lambda (x)
+                (if (subpackage-braces-path? x)
+                    (map (lambda (sub) `(|::| ,(cadr x) ,sub)) (cdr (caddr x)))
+                    (list x)))
+              paths)))
 
 ;; table mapping expression head to a function expanding that form
 (define expand-table
@@ -3174,7 +3200,7 @@
                      `(block
                        (call (top _eval_import) (true) (thismodule) (null) (inert ,x))
                        (latestworld)))
-                   (cdr e)))))
+                   (expand-subpackage-braces (cdr e))))))
 
     'using
     (lambda (e)
@@ -3189,7 +3215,7 @@
                      `(block
                        (call (top _eval_using) (thismodule) (inert ,x))
                        (latestworld)))
-                   (cdr e)))))
+                   (expand-subpackage-braces (cdr e))))))
     ))
 
 (define (has-return? e)

@@ -2695,6 +2695,29 @@ function parse_import(ps::ParseState, word, has_import_prefix)
         bump(ps, TRIVIA_FLAG)
         if peek(ps) == K"Identifier" && !preceding_whitespace(peek_token(ps))
             bump(ps)
+        elseif peek(ps) == K"{" && !preceding_whitespace(peek_token(ps))
+            # Several subpackages of the same package
+            # using A::{B, C}  ==>  (using (:: (importpath A) (braces B C)))
+            # using A::{B,}    ==>  (using (:: (importpath A) (braces B)))
+            # using A::{
+            #     B, C}        ==>  (using (:: (importpath A) (braces B C)))
+            # using A::{}      ==>  (using (:: (importpath A) (braces (error))))
+            # using A::{B C}   ==>  (using (:: (importpath A) (braces B (error-t C))))
+            bmark = position(ps)
+            bump(ps, TRIVIA_FLAG)
+            ps1 = ParseState(ps, whitespace_newline=true)
+            while true
+                if peek(ps1) == K"Identifier"
+                    bump(ps1)
+                else
+                    bump_invisible(ps1, K"error", error="expected a subpackage name")
+                end
+                peek(ps1) == K"," || break
+                bump(ps1, TRIVIA_FLAG)
+                peek(ps1) == K"}" && break
+            end
+            bump_closing_token(ps1, K"}")
+            emit(ps, bmark, K"braces")
         else
             # using A:: B  ==>  (using (:: (importpath A) (error)))
             bump_invisible(ps, K"error", error="expected a subpackage name directly after `::`")

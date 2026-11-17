@@ -865,6 +865,12 @@ tests = [
         ((v=v"1.15",), "using A::B: x, y") => "(using (: (:: (importpath A) B) (importpath x) (importpath y)))"
         ((v=v"1.15",), "using A:: B")      => "(using (:: (importpath A) (error)))"
         ((v=v"1.14",), "using A::B")       => "(using (importpath A))"
+        ((v=v"1.15",), "using A::{B, C}")  => "(using (:: (importpath A) (braces B C)))"
+        ((v=v"1.15",), "using A::{B,}")    => "(using (:: (importpath A) (braces B)))"
+        ((v=v"1.15",), "using A::{\nB,\nC\n}") => "(using (:: (importpath A) (braces B C)))"
+        ((v=v"1.15",), "using A, A::{B}")  => "(using (importpath A) (:: (importpath A) (braces B)))"
+        ((v=v"1.15",), "using A::{}")      => "(using (:: (importpath A) (braces (error))))"
+        ((v=v"1.15",), "using A::{B C}")   => "(using (:: (importpath A) (braces B (error-t C))))"
         # parse_import_path
         # When parsing import we must split initial dots into nontrivial
         # leading dots for relative paths

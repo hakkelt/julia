@@ -2148,9 +2148,13 @@ function insert_subpackage_triggers(env::String, pkg::PkgId)
     totaldeps = merge(get(Dict{String, Any}, d, "weakdeps")::Dict{String, Any},
                       get(Dict{String, Any}, d, "deps")::Dict{String, Any})
     autoloads = Dict{String, Any}()
+    selected = missing
     for name in keys(subs)
         triggers = subpackage_autoload_triggers(d, name)
         triggers === nothing && continue
+        # only the subpackages that the environment uses are installed and autoload
+        selected === missing && (selected = environment_subpackage_selection(env, pkg, d))
+        selected === nothing || name in selected || continue
         unknown = filter(t -> !haskey(totaldeps, t), triggers)
         if !isempty(unknown)
             @warn "Ignoring `autoload` for subpackage $name of $(pkg.name): triggers $(join(unknown, ", ")) \
@@ -2165,6 +2169,78 @@ function insert_subpackage_triggers(env::String, pkg::PkgId)
         isempty(siblings) || (SUBPKG_AUTOLOAD_SIBLINGS[PkgId(uuid5(pkg.uuid::UUID, name), name)] = siblings)
     end
     return
+end
+
+# The subpackages of `pkg` (with subpackage definitions `d`) that environment `env` uses,
+# with the sibling subpackages they need, or `nothing` for all of them. A project uses the
+# subpackages that the [subdeps] of the projects in its workspace or of the packages in its
+# manifest list. The package's own environment (it is the active project or a member of
+# its workspace) uses all of them, and so does an implicit environment.
+function environment_subpackage_selection(env::String, pkg::PkgId, d::Dict{String, Any})::Union{Nothing, Set{String}}
+    project_file = env_project_file(env)
+    project_file isa String || return nothing
+    puuid = string(pkg.uuid)
+    selected = Set{String}()
+    function add!(subdeps, deps)
+        subdeps isa Dict{String, Any} || return
+        for (name, subs) in subdeps
+            get(deps, name, nothing) == puuid || continue
+            if subs isa String
+                push!(selected, subs)
+            elseif subs isa Vector
+                for sub in subs
+                    sub isa String && push!(selected, sub)
+                end
+            end
+        end
+    end
+    for file in workspace_project_files(project_file)
+        p = parsed_toml(file)
+        get(p, "uuid", nothing) == puuid && return nothing
+        deps = merge(get(Dict{String, Any}, p, "deps")::Dict{String, Any},
+                     get(Dict{String, Any}, p, "weakdeps")::Dict{String, Any})
+        add!(get(p, "subdeps", nothing), deps)
+    end
+    manifest_file = project_file_manifest_path(project_file)
+    if manifest_file !== nothing
+        md = get_deps(parsed_toml(manifest_file))
+        for (_, entries) in md
+            for entry in entries::Vector{Any}
+                entry = entry::Dict{String, Any}
+                subdeps = get(entry, "subdeps", nothing)
+                subdeps isa Dict{String, Any} || continue
+                add!(subdeps, manifest_expand_deps(md, get(entry, "deps", nothing)))
+            end
+        end
+    end
+    for sub in collect(selected)
+        union!(selected, subpackage_sibling_closure(d, sub))
+    end
+    return selected
+end
+
+# The project files of the workspace that `project_file` belongs to (just `project_file`
+# outside of a workspace)
+function workspace_project_files(project_file::String)
+    root = something(base_project(project_file), project_file)
+    files = String[]
+    todo = String[root]
+    while !isempty(todo)
+        file = abspath(pop!(todo))
+        file in files && continue
+        push!(files, file)
+        workspace = get(parsed_toml(file), "workspace", nothing)
+        workspace isa Dict{String, Any} || continue
+        projects = get(workspace, "projects", nothing)
+        projects isa Vector || continue
+        for member in projects
+            member isa String || continue
+            member_file = env_project_file(joinpath(dirname(file), member))
+            member_file isa String && push!(todo, member_file)
+        end
+    end
+    abspath(project_file) in files || push!(files, abspath(project_file))
+    return files
 end
 
 # The sibling subpackages that subpackage `name` depends on, directly or not
@@ -2357,19 +2433,6 @@ function __require_subpackage(into::Module, parent::Symbol, sub::Symbol)
     end
 end
 
-"""
-    Base.@subpackage using Parent::Sub
-    Base.@subpackage import Parent::Sub
-
-Load subpackage `Sub` of package `Parent` and bind it to the name `Sub` in the current
-module. The `using` form also brings `Sub`'s exported names into scope, as `using Sub`
-would for a package. Equivalent to `using Parent::Sub` and `import Parent::Sub`, which
-need syntax version 1.15 (see [Subpackages](@ref man-subpackages)); in older syntax
-versions, `using A::B` parses as a type assertion on `using A`.
-
-!!! warning
-    Prototype. The interface may change or go away.
-"""
 # Is the module identified by `where` allowed to load subpackage `sub` of `parent`
 # explicitly? It must be declared in the [subdeps] section of a project file:
 #
@@ -2455,27 +2518,63 @@ function is_required_subpackage(requires::Vector{Pair{PkgId, PkgId}}, modkey::Pk
     return false
 end
 
+"""
+    Base.@subpackage using Parent::Sub
+    Base.@subpackage import Parent::Sub
+    Base.@subpackage using Parent::{Sub1, Sub2}
+    Base.@subpackage using Parent, Parent::{Sub1}
+
+Load subpackage `Sub` of package `Parent` and bind it to the name `Sub` in the current
+module. The `using` form also brings `Sub`'s exported names into scope, as `using Sub`
+would for a package. `Parent::{Sub1, Sub2}` loads several subpackages of the same
+package, and other packages may be listed in the same statement. Equivalent to the same
+statements without the macro, which need syntax version 1.15 (see
+[Subpackages](@ref man-subpackages)); in older syntax versions, `using A::B` parses as a
+type assertion on `using A`.
+
+!!! warning
+    Prototype. The interface may change or go away.
+"""
 macro subpackage(ex)
-    usage = "expected `@subpackage using Parent::Sub` or `@subpackage import Parent::Sub`"
-    if ex isa Expr && (ex.head === :using || ex.head === :import) && length(ex.args) == 1 &&
-            Meta.isexpr(ex.args[1], :(::), 2)
-        # from syntax version 1.15, `using A::B` parses as `using (A::B)`
-        stmt = Expr(ex.head, ex.args[1].args[1])
-        sub = ex.args[1].args[2]
+    usage = "expected `@subpackage using Parent::Sub`, `@subpackage import Parent::Sub` or \
+             `@subpackage using Parent::{Sub1, Sub2}`"
+    (ex isa Expr && (ex.head === :using || ex.head === :import || ex.head === :(::))) ||
+        throw(ArgumentError(usage))
+    if ex.head === :(::)
+        # before syntax version 1.15, `using A, B::C` parses as `(using A, B)::C`
+        length(ex.args) == 2 || throw(ArgumentError(usage))
+        stmt, subs = ex.args
+        (stmt isa Expr && (stmt.head === :using || stmt.head === :import) && !isempty(stmt.args)) ||
+            throw(ArgumentError(usage))
+        paths = Any[stmt.args[1:end-1]..., Expr(:(::), stmt.args[end], subs)]
+        head = stmt.head
     else
-        # before, as `(using A)::B`
-        (ex isa Expr && ex.head === :(::) && length(ex.args) == 2) || throw(ArgumentError(usage))
-        stmt, sub = ex.args
+        # from syntax version 1.15, as `using A, (B::C)`
+        paths = ex.args
+        head = ex.head
     end
-    (stmt isa Expr && (stmt.head === :using || stmt.head === :import) && length(stmt.args) == 1 && sub isa Symbol) ||
-        throw(ArgumentError(usage))
-    path = stmt.args[1]
-    (path isa Expr && path.head === :. && length(path.args) == 1 && path.args[1] isa Symbol) ||
-        throw(ArgumentError(usage))
-    parent = path.args[1]::Symbol
-    load = Expr(:call, GlobalRef(Base, :require_subpackage), __module__, QuoteNode(parent), QuoteNode(sub))
-    ret = Expr(:toplevel, Expr(:const, Expr(:(=), sub, load)))
-    stmt.head === :using && push!(ret.args, Expr(:using, Expr(:., :., sub)))
+    ret = Expr(:toplevel)
+    for path in paths
+        if Meta.isexpr(path, :(::), 2)
+            parentpath, subs = path.args
+            (parentpath isa Expr && parentpath.head === :. && length(parentpath.args) == 1 &&
+                parentpath.args[1] isa Symbol && parentpath.args[1] !== :.) || throw(ArgumentError(usage))
+            parent = parentpath.args[1]::Symbol
+            subs = Meta.isexpr(subs, :braces) ? subs.args : Any[subs]
+            (!isempty(subs) && all(x -> x isa Symbol, subs)) || throw(ArgumentError(usage))
+            for sub in subs
+                load = Expr(:call, GlobalRef(Base, :require_subpackage), __module__, QuoteNode(parent), QuoteNode(sub))
+                push!(ret.args, Expr(:const, Expr(:(=), sub, load)))
+                head === :using && push!(ret.args, Expr(:using, Expr(:., :., sub)))
+            end
+        elseif Meta.isexpr(path, :.)
+            # a package next to the subpackages, `@subpackage using Parent, Parent::Sub`
+            push!(ret.args, Expr(head, path))
+        else
+            throw(ArgumentError(usage))
+        end
+    end
+    any(p -> Meta.isexpr(p, :(::)), paths) || throw(ArgumentError(usage))
     push!(ret.args, nothing)
     return esc(ret)
 end

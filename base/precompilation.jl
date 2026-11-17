@@ -758,6 +758,12 @@ function ExplicitEnv(envpath::String)
     if proj_name !== nothing && proj_uuid !== nothing
         deps_expanded[proj_uuid] = filter!(!=(proj_uuid), collect(values(project_deps)))
         extensions_expanded[proj_uuid] = project_extensions
+        if get(project_d, "subpackages", nothing) isa Dict{String, Any}
+            # a package's own environment uses all of its subpackages
+            subpackage_defs[proj_uuid] = project_d
+            subpackages[proj_uuid] = collect(String, keys(project_d["subpackages"]::Dict{String, Any}))
+            weakdeps_expanded[proj_uuid] = collect(values(project_weakdeps))
+        end
         path = get(project_d, "path", nothing)::Union{String, Nothing}
         entry_point = path !== nothing ? path : dirname(envpath)
         lookup_strategy[proj_uuid] = entry_point
@@ -1151,7 +1157,15 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
         autoloads = Dict{PkgId, Vector{PkgId}}()
         weakdeps_d = get(Dict{String, Any}, d, "weakdeps")::Dict{String, Any}
         deps_d = get(Dict{String, Any}, d, "deps")::Dict{String, Any}
+        # only explicitly selected subpackages (and the siblings they need) hold up the
+        # dependents of the parent; autoloaded ones are waited for like extensions
+        explicit = Set{String}(selected)
+        for sub in selected
+            union!(explicit, Base.subpackage_sibling_closure(d, sub))
+        end
         for name in keys(get(Dict{String, Any}, d, "subpackages")::Dict{String, Any})
+            # only the subpackages in use are installed and autoload
+            name in explicit || continue
             trigger_names = Base.subpackage_autoload_triggers(d, name)
             trigger_names === nothing && continue
             trigger_ids = PkgId[pkg]
@@ -1169,12 +1183,6 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
         isempty(selected) && isempty(autoloads) && continue
         add_subpackage_nodes!(direct_deps, parent_to_subs, pkg, d,
                               union(selected, String[id.name for id in keys(autoloads)]), pkg_uuids)
-        # only explicitly selected subpackages (and the siblings they need) hold up the
-        # dependents of the parent; autoloaded ones are waited for like extensions
-        explicit = Set{String}(selected)
-        for sub in selected
-            union!(explicit, Base.subpackage_sibling_closure(d, sub))
-        end
         if haskey(parent_to_subs, pkg)
             filter!(id -> id.name in explicit, parent_to_subs[pkg])
             isempty(parent_to_subs[pkg]) && delete!(parent_to_subs, pkg)

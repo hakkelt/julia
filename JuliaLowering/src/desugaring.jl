@@ -4247,7 +4247,17 @@ function expand_import_or_using(ctx, ex)
         # (call eval_import true nothing (call core.svec 1 "w"))
         @jl_assert numchildren(ex) >= 1 ex
         from_path = nothing
-        paths = children(ex)
+        # `Parent::{Sub1, Sub2}` is `Parent::Sub1, Parent::Sub2`
+        paths = SyntaxList()
+        for spec in children(ex)
+            if head(spec) == :(::) && head(spec[2]) == :braces
+                for sub in children(spec[2])
+                    push!(paths, @ast ctx spec [:(::) spec[1] sub])
+                end
+            else
+                push!(paths, spec)
+            end
+        end
     end
     # Here we represent the paths as quoted `Expr` data structures
     path_specs = SyntaxList()

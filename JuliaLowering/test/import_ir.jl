@@ -77,6 +77,42 @@ using A::B: f, g as h
 3   (return core.nothing)
 
 ########################################
+# Several subpackages
+using A, A::{B, C}
+#---------------------
+1   (call JuliaLowering.eval_using TestMod (inert (. A)))
+2   latestworld
+3   (call JuliaLowering.eval_using TestMod (inert (:: (. A) B)))
+4   latestworld
+5   (call JuliaLowering.eval_using TestMod (inert (:: (. A) C)))
+6   latestworld
+7   (return core.nothing)
+
+########################################
+# Several subpackages with `import`
+import A::{B}
+#---------------------
+1   (call JuliaLowering.eval_import true TestMod core.nothing (inert (:: (. A) B)))
+2   latestworld
+3   (return core.nothing)
+
+########################################
+# Error: several subpackages renamed
+import A::{B, C} as D
+#---------------------
+LoweringError:
+import A::{B, C} as D
+#     └────────┘ ── several subpackages `Parent::{...}` cannot be renamed with `as`
+
+########################################
+# Error: several subpackages before `:`
+using A::{B, C}: f
+#---------------------
+LoweringError:
+using A::{B, C}: f
+#    └────────┘ ── several subpackages `Parent::{...}` cannot be combined with `:`
+
+########################################
 # Error: subpackage after `:`
 using A: B::C
 #---------------------

@@ -355,6 +355,7 @@ if isdefined(Base, :require_subpackage) && isdir(subpackage_fixtures)
         include_string(Main, "using Solvers::BDF: BDFAlg; print(BDFAlg, '|')")
         Core.eval(Main, Expr(:import, Expr(:as, Expr(:(::), Expr(:., :Solvers), :Tsit5), :T2)))
         print(T2 === Tsit5, '|')
+        include_string(Main, "using Solvers, Solvers::{Tsit5, Common}; print(nameof(Common), isdefined(Main, :Solvers), '|')")
         try
             include_string(Main, "using .Solvers::Tsit5")
         catch e
@@ -365,7 +366,7 @@ if isdefined(Base, :require_subpackage) && isdir(subpackage_fixtures)
         cmd = addenv(`$(Base.julia_cmd()) --startup-file=no --project=$(joinpath(fixtures, "env")) -e $code`,
                      "JULIA_LOAD_PATH" => load_path,
                      "JULIA_DEPOT_PATH" => joinpath(dir, "depot") * (Sys.iswindows() ? ";" : ":"))
-        @test read(cmd, String) == "tsit5 via light|Common|BDFAlg|true|true"
+        @test read(cmd, String) == "tsit5 via light|Common|BDFAlg|true|Commontrue|true"
     end
 end
 end

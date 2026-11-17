@@ -404,9 +404,9 @@ vst1_toplevel_only(vcx, st) = @stm st begin
         (vst1_importpath(vcx, p1; dots_ok=true) &
         allv(vst1_importpath_nodots, vcx, ps))
     [:import ps...] ->
-        minlen(st, ps, 1) & allv(vst1_importpath_dots, vcx, ps)
+        minlen(st, ps, 1) & allv(vst1_importpath_multi, vcx, ps)
     [:using  ps...] ->
-        minlen(st, ps, 1) & allv(vst1_importpath_dots, vcx, ps)
+        minlen(st, ps, 1) & allv(vst1_importpath_multi, vcx, ps)
     [:public xs...] -> allv(vst1_ident, vcx, xs)
     [:export xs...] -> allv(vst1_ident, vcx, xs)
     [:latestworld] -> pass()
@@ -440,7 +440,9 @@ end
 # where y, z may be quoted (syntax TODO: require var"" for odd identifiers?)
 vst1_importpath_dots(vcx, st) = vst1_importpath(vcx, st; dots_ok=true)
 vst1_importpath_nodots(vcx, st) = vst1_importpath(vcx, st; dots_ok=false)
-function vst1_importpath(vcx, st; dots_ok)
+# a path of its own, not one before `:`: `Parent::{Sub1, Sub2}` is allowed
+vst1_importpath_multi(vcx, st) = vst1_importpath(vcx, st; dots_ok=true, braces_ok=true)
+function vst1_importpath(vcx, st; dots_ok, braces_ok=false)
     ok = pass()
     # A subpackage, `Parent::Sub` or `Parent::Sub as name` (syntax version 1.15+). That
     # `Parent` names a top-level package is checked when the import is evaluated.
@@ -451,7 +453,20 @@ function vst1_importpath(vcx, st; dots_ok)
         end
         dots_ok || return ok & @fail(sub, "a subpackage `Parent::Sub` cannot follow `:`")
         numchildren(sub) == 2 || return @fail(sub, "malformed import path")
-        head(sub[2]) === :identifier || (ok &= @fail(sub[2], "expected subpackage name"))
+        if head(sub[2]) === :braces
+            # several subpackages, `Parent::{Sub1, Sub2}`
+            if head(st) === :as
+                ok &= @fail(sub, "several subpackages `Parent::{...}` cannot be renamed with `as`")
+            elseif !braces_ok
+                ok &= @fail(sub, "several subpackages `Parent::{...}` cannot be combined with `:`")
+            end
+            numchildren(sub[2]) >= 1 || (ok &= @fail(sub[2], "expected subpackage name"))
+            for c in children(sub[2])
+                head(c) === :identifier || (ok &= @fail(c, "expected subpackage name"))
+            end
+        else
+            head(sub[2]) === :identifier || (ok &= @fail(sub[2], "expected subpackage name"))
+        end
         return ok & vst1_importpath(vcx, sub[1]; dots_ok=true)
     end
     path_components = @stm st begin

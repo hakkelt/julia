@@ -1881,6 +1881,29 @@ inline(val) = val == 1 ? `--inline=yes` : `--inline=no`
         Expr(:using, Expr(:(:), Expr(:(::), Expr(:., :A), :B), Expr(:., :f)))
     @test Base.JuliaSyntax.parsestmt(Expr, "import A::B as C"; version = v"1.15") ==
         Expr(:import, Expr(:as, Expr(:(::), Expr(:., :A), :B), :C))
+    @test Base.JuliaSyntax.parsestmt(Expr, "using A, A::{B, C}"; version = v"1.15") ==
+        Expr(:using, Expr(:., :A), Expr(:(::), Expr(:., :A), Expr(:braces, :B, :C)))
+    @testset "several subpackages, `using Parent::{A, B}`" begin
+        out, outerr, ok = run_subpkg("""
+            Base.Experimental.@set_syntax_version v"1.15"
+            include_string(Main, "using Solvers, Solvers::{Tsit5, BDF}")
+            print(Tsit5.solve(Tsit5Alg()), "|", BDF.solve(BDFAlg()), "|", isdefined(Main, :Solvers))
+            """)
+        @test ok
+        @test out == "tsit5 via light|bdf via heavy, parent loaded: true|true"
+        out, outerr, ok = run_subpkg("""
+            Base.@subpackage using Solvers, Solvers::{Tsit5, Common}
+            print(Tsit5.solve(Tsit5Alg()), "|", nameof(Common), "|", isdefined(Main, :Solvers))
+            """)
+        @test ok
+        @test out == "tsit5 via light|Common|true"
+        # not with `as` or before `:`
+        for code in ("import Solvers::{Tsit5, BDF} as T", "using Solvers::{Tsit5, BDF}: solve")
+            ex = Base.JuliaSyntax.parsestmt(Expr, code; version = v"1.15")
+            lowered = Meta.lower(@__MODULE__, ex)
+            @test Meta.isexpr(lowered, :error) && occursin("several subpackages `Parent::{...}` cannot be", string(lowered.args[1]))
+        end
+    end
 
     @testset "downstream packages and precompilation" begin
         depot = mkdepottempdir()
@@ -1948,6 +1971,26 @@ inline(val) = val == 1 ? `--inline=yes` : `--inline=no`
         @test ok
         @test occursin("Ignoring `autoload` for subpackage Lazy", outerr)
         @test endswith(out, "true")
+        # only the subpackages that the environment uses autoload
+        out, outerr, ok = run_subpkg("""
+            using Solvers, Heavy, Helper
+            issub(n) = Base.get_extension(Solvers, n) !== nothing
+            print(issub(:Plots), issub(:Recipes), issub(:Lazy))
+            """; edit! = d -> replace_line(joinpath(d, "env", "Project.toml"), r"^Solvers = \[",
+                                           "Solvers = [\"Common\", \"Tsit5\", \"BDF\", \"Plots\"]"))
+        @test ok
+        @test out == "truefalsefalse"
+        # ...including those a package in the manifest uses
+        out, outerr, ok = run_subpkg("""
+            using Solvers, Heavy, Helper
+            issub(n) = Base.get_extension(Solvers, n) !== nothing
+            print(issub(:Plots), issub(:Recipes), issub(:Lazy))
+            """; edit! = d -> (replace_line(joinpath(d, "env", "Project.toml"), r"^Solvers = \[",
+                                            "Solvers = [\"Common\", \"Tsit5\", \"BDF\"]");
+                               replace_line(joinpath(d, "env", "Manifest.toml"), r"^\s*Solvers = \[\"Tsit5\"\]",
+                                            "    Solvers = [\"Tsit5\", \"Lazy\"]")))
+        @test ok
+        @test out == "falsefalsetrue"
     end
 
     @testset "macro" begin
@@ -1959,6 +2002,15 @@ inline(val) = val == 1 ? `--inline=yes` : `--inline=no`
         new = macroexpand(@__MODULE__, Expr(:macrocall, GlobalRef(Base, Symbol("@subpackage")), LineNumberNode(1),
                                             Expr(:using, Expr(:(::), Expr(:., :Solvers), :Tsit5))))
         @test old == new
+        # `Parent::{A, B}`, before and after syntax version 1.15
+        old = macroexpand(@__MODULE__, Expr(:macrocall, GlobalRef(Base, Symbol("@subpackage")), LineNumberNode(1),
+                                            Expr(:(::), Expr(:using, Expr(:., :Solvers), Expr(:., :Solvers)), Expr(:braces, :Tsit5, :BDF))))
+        new = macroexpand(@__MODULE__, Expr(:macrocall, GlobalRef(Base, Symbol("@subpackage")), LineNumberNode(1),
+                                            Expr(:using, Expr(:., :Solvers), Expr(:(::), Expr(:., :Solvers), Expr(:braces, :Tsit5, :BDF)))))
+        @test old == new
+        @test count(ex -> Meta.isexpr(ex, :const), new.args) == 2
+        @test_throws ArgumentError macroexpand(@__MODULE__, Expr(:macrocall, GlobalRef(Base, Symbol("@subpackage")), LineNumberNode(1),
+                                                                 Expr(:using, Expr(:(::), Expr(:., :Solvers), Expr(:braces)))))
     end
 end
 

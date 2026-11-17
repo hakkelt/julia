@@ -438,7 +438,10 @@ usual forms `import Parent::Sub as S` and `using Parent::Sub: name`. This syntax
 from [syntax version](@ref syntax-versioning) 1.15. In code parsed with an older syntax
 version, `using A::B` is a type assertion on the `using` statement, and
 `Base.@subpackage using Parent::Sub` is the equivalent of `using Parent::Sub` and binds `Sub`
-in the current module.
+in the current module. Several subpackages of the same package can be loaded at once with
+`using Parent::{Sub1, Sub2}`, also next to the parent itself, as in
+`using Parent, Parent::{Sub1}`. This form cannot be renamed with `as` or precede `:`.
+Loading a subpackage does not bring the parent's exported names into scope.
 
 Packages and projects that load a subpackage declare it in their `[subdeps]` section, next
 to the parent in their `[deps]`:
@@ -455,11 +458,16 @@ The package manager reads `[subdeps]` to install the weak dependencies that the 
 subpackages need (and only those), and to restrict the parent to versions that have them.
 Loading a subpackage that is not declared is an error. The parent, its extensions and its
 other subpackages need no declaration, nor does top-level code in an implicit environment.
+The parent's own environment, where the parent is the active project or a member of its
+workspace, includes all of its subpackages and needs no declaration either.
 
 A subpackage with `autoload = true` is also loaded automatically, like an extension, once its
 parent and the weak dependencies that it and its sibling dependencies need are loaded.
 `autoload` may also be a list of packages that trigger it. An autoloaded subpackage does not
-bring any names into scope, and `Base.get_extension(Parent, :Sub)` returns it.
+bring any names into scope, and `Base.get_extension(Parent, :Sub)` returns it. Only the
+subpackages that the environment uses autoload (and are precompiled): those that a
+`[subdeps]` section in the workspace's projects or in the manifest lists, the sibling
+subpackages they need, and all of them in the parent's own environment.
 
 When a package with subpackages is added to an environment, its `[subpackages]` and
 `[subdeps]` sections are stored in its manifest entry, and the loader reads them from there.
