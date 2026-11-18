@@ -468,6 +468,17 @@ subpackages that the environment uses autoload (and are precompiled): those that
 `[subdeps]` section in the workspace's projects or in the manifest lists, the sibling
 subpackages they need, and all of them in the parent's own environment.
 
+An extension of the parent may list subpackages of the parent among its triggers, which makes
+it an extension of those subpackages:
+
+```toml
+[extensions]
+Tsit5PlotsExt = ["Tsit5", "Makie"]
+```
+
+It loads once the parent, the subpackage `Tsit5` and `Makie` are loaded, and is precompiled
+after `Tsit5`. If the environment does not use `Tsit5`, it never loads.
+
 When a package with subpackages is added to an environment, its `[subpackages]` and
 `[subdeps]` sections are stored in its manifest entry, and the loader reads them from there.
 The parent's project file is read only when the parent is the active project or is in a

@@ -1926,7 +1926,7 @@ function insert_extension_triggers(env::String, pkg::PkgId)::Union{Nothing,Missi
             extensions === nothing && return
             weakdeps = get(Dict{String, Any}, d_proj, "weakdeps")::Dict{String,Any}
             deps = get(Dict{String, Any}, d_proj, "deps")::Dict{String,Any}
-            total_deps = merge(weakdeps, deps)
+            total_deps = merge(subpackage_trigger_uuids(pkg, d_proj), weakdeps, deps)
             return _insert_extension_triggers(pkg, extensions, total_deps)
         end
 
@@ -1973,10 +1973,23 @@ function insert_extension_triggers(env::String, pkg::PkgId)::Union{Nothing,Missi
             deps = expand_deps_list(deps)
         end
 
-        total_deps = merge(weakdeps, deps)
+        total_deps = merge(sub_d === nothing ? Dict{String, Any}() : subpackage_trigger_uuids(pkg, sub_d),
+                           weakdeps, deps)
         return _insert_extension_triggers(pkg, extensions, total_deps)
     end
     return nothing
+end
+
+# An extension of a package may also be triggered by subpackages of that package (an
+# extension of the subpackage, in effect): their names map to their uuids
+function subpackage_trigger_uuids(pkg::PkgId, d::Dict{String, Any})
+    subs = get(d, "subpackages", nothing)::Union{Nothing, Dict{String, Any}}
+    uuids = Dict{String, Any}()
+    subs === nothing && return uuids
+    for name in keys(subs)
+        uuids[name] = string(uuid5(pkg.uuid::UUID, name))
+    end
+    return uuids
 end
 
 function _insert_extension_triggers(parent::PkgId, extensions::Dict{String, Any}, totaldeps::Dict{String, Any})

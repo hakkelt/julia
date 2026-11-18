@@ -1996,6 +1996,51 @@ inline(val) = val == 1 ? `--inline=yes` : `--inline=no`
         @test out == "falsefalsetrue"
     end
 
+    @testset "a subpackage triggers an extension of its parent" begin
+        # an extension of the parent that names one of its subpackages among its triggers
+        # extends that subpackage: it loads once the subpackage and the other triggers are
+        # loaded, and is precompiled after the subpackage
+        function add_ext(d)
+            mkpath(joinpath(d, "Solvers", "ext"))
+            write(joinpath(d, "Solvers", "ext", "Tsit5HelperExt.jl"), """
+                module Tsit5HelperExt
+                using Solvers::Tsit5, Helper
+                Tsit5.solve(::Tsit5.Tsit5Alg, ::typeof(Helper.helper)) = "tsit5 with " * Helper.helper()
+                end
+                """)
+            f = joinpath(d, "Solvers", "Project.toml")
+            write(f, read(f, String) * "\n[extensions]\nTsit5HelperExt = [\"Tsit5\", \"Helper\"]\n")
+            replace_line(joinpath(d, "env", "Manifest.toml"), r"^\s*\[deps\.Solvers\.subpackages\]",
+                         "    [deps.Solvers.extensions]\n    Tsit5HelperExt = [\"Tsit5\", \"Helper\"]\n\n    [deps.Solvers.subpackages]")
+        end
+        ext_id = "Base.PkgId(Base.uuid5(Base.UUID(\"$solvers_uuid\"), \"Tsit5HelperExt\"), \"Tsit5HelperExt\")"
+        out, outerr, ok = run_subpkg("""
+            ext() = Base.get_extension(Solvers, :Tsit5HelperExt) !== nothing
+            using Solvers, Helper
+            print(ext(), "|")
+            using Solvers::Tsit5
+            print(ext(), "|", Tsit5.solve(Tsit5Alg(), Helper.helper))
+            """; edit! = add_ext)
+        @test ok
+        @test out == "false|true|tsit5 with helper"
+        # the parent loaded last (`Tsit5` does not load it, and `using Solvers::Tsit5` does not
+        # bind it), once the other triggers are loaded
+        out, outerr, ok = run_subpkg("""
+            using Solvers::Tsit5, Helper
+            print(haskey(Base.loaded_modules, Base.PkgId(Base.UUID("$solvers_uuid"), "Solvers")), "|")
+            using Solvers
+            print(Base.get_extension(Solvers, :Tsit5HelperExt) !== nothing)
+            """; edit! = add_ext)
+        @test ok
+        @test out == "false|true"
+        out, outerr, ok = run_subpkg("""
+            Base.Precompilation.precompilepkgs(; io = devnull)
+            print(Base.isprecompiled($ext_id))
+            """; edit! = add_ext)
+        @test ok
+        @test out == "true"
+    end
+
     @testset "a parent in a workspace" begin
         # the workspace of the parent is its own environment: all its subpackages are in
         # use, also when another member is the active project

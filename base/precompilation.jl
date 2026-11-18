@@ -644,6 +644,11 @@ function ExplicitEnv(envpath::String)
         uuids = UUID[]
         for trigger in triggers
             uuid = get(project_name_to_uuid, trigger, nothing)
+            if uuid === nothing && proj_uuid !== nothing && Base.subpackage_deps(project_d, trigger) !== nothing
+                # a subpackage of the project
+                uuid = Base.uuid5(proj_uuid, trigger)
+                names[uuid] = trigger
+            end
             if uuid === nothing
                 error("Trigger $trigger for extension $name not found in project")
             end
@@ -789,8 +794,16 @@ function ExplicitEnv(envpath::String)
         for (ext, triggers) in exts
             triggers_expanded = UUID[]
             sizehint!(triggers_expanded, length(triggers))
+            sub_d = get(subpackage_defs, pkg, nothing)
             for trigger in triggers
-                push!(triggers_expanded, name_to_uuid[trigger])
+                if sub_d !== nothing && Base.subpackage_deps(sub_d, trigger) !== nothing
+                    # a subpackage of the package itself
+                    uuid = Base.uuid5(pkg, trigger)
+                    names[uuid] = trigger
+                    push!(triggers_expanded, uuid)
+                else
+                    push!(triggers_expanded, name_to_uuid[trigger])
+                end
             end
             exts_expanded[ext] = triggers_expanded
         end
@@ -1103,6 +1116,23 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
         end
     end
 
+    # The subpackages in use, by parent, with the sibling subpackages they need: these get
+    # nodes (below) and may trigger extensions of their parent
+    subs_in_use = Dict{UUID, Set{String}}()
+    for dep in pkg_uuids
+        (haskey(env.subpackage_defs, dep) && haskey(env.deps, dep)) || continue
+        selected = get(Vector{String}, env.subpackages, dep)
+        isempty(selected) && continue
+        explicit = Set{String}(selected)
+        for sub in selected
+            union!(explicit, Base.subpackage_sibling_closure(env.subpackage_defs[dep], sub))
+        end
+        subs_in_use[dep] = explicit
+    end
+    is_sub_in_use(parent::UUID, uuid::UUID) =
+        haskey(subs_in_use, parent) && haskey(env.names, uuid) && env.names[uuid] in subs_in_use[parent] &&
+        uuid == Base.uuid5(parent, env.names[uuid])
+
     for dep in pkg_uuids
         haskey(env.deps, dep) || continue
         pkg = PkgId(dep, env.names[dep])
@@ -1116,7 +1146,7 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
             all_triggers_available = true
             for trigger_uuid in trigger_uuids
                 trigger_name = PkgId(trigger_uuid, env.names[trigger_uuid])
-                if trigger_uuid in pkg_uuids || Base.in_sysimage(trigger_name)
+                if trigger_uuid in pkg_uuids || Base.in_sysimage(trigger_name) || is_sub_in_use(dep, trigger_uuid)
                     push!(triggers[ext], trigger_name)
                 else
                     all_triggers_available = false
@@ -1143,16 +1173,11 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
         pkg = PkgId(dep, env.names[dep])
         haskey(direct_deps, pkg) || continue
         d = env.subpackage_defs[dep]
-        selected = get(Vector{String}, env.subpackages, dep)
-        isempty(selected) && continue
+        explicit = get(subs_in_use, dep, nothing)
+        explicit === nothing && continue
         autoloads = Dict{PkgId, Vector{PkgId}}()
         weakdeps_d = get(Dict{String, Any}, d, "weakdeps")::Dict{String, Any}
         deps_d = get(Dict{String, Any}, d, "deps")::Dict{String, Any}
-        # the selected subpackages and the siblings they need
-        explicit = Set{String}(selected)
-        for sub in selected
-            union!(explicit, Base.subpackage_sibling_closure(d, sub))
-        end
         for name in keys(get(Dict{String, Any}, d, "subpackages")::Dict{String, Any})
             # only the subpackages in use are installed and autoload
             name in explicit || continue
