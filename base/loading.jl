@@ -925,10 +925,11 @@ function manifest_uuid_load_spec(env::String, pkg::PkgId)::Union{Nothing,PkgLoad
 end
 
 
-function find_ext_path(project_path::String, extname::String)
-    extfiledir = joinpath(project_path, "ext", extname, extname * ".jl")
+# `dir` is "ext" for extensions and "sub" for subpackages
+function find_ext_path(project_path::String, extname::String, dir::String="ext")
+    extfiledir = joinpath(project_path, dir, extname, extname * ".jl")
     isfile(extfiledir) && return extfiledir
-    return joinpath(project_path, "ext", extname * ".jl")
+    return joinpath(project_path, dir, extname * ".jl")
 end
 
 function project_file_ext_load_spec(project_file::String, ext::PkgId)
@@ -986,17 +987,7 @@ end
 is_subpackage_of(d::Dict{String, Any}, parent_uuid::UUID, sub::PkgId) =
     subpackage_deps(d, sub.name) !== nothing && sub.uuid == uuid5(parent_uuid, sub.name)
 
-function find_subpkg_path(project_path::String, name::String)
-    subfiledir = joinpath(project_path, "sub", name, name * ".jl")
-    isfile(subfiledir) && return subfiledir
-    return joinpath(project_path, "sub", name * ".jl")
-end
-
-# The Project.toml at the root of the package whose entry point is `entry_path` (`src/Pkg.jl`)
-function package_root_project_file(entry_path::String)::Union{Nothing, String}
-    project_file = locate_project_file(normpath(dirname(entry_path), ".."))
-    return project_file isa String ? project_file : nothing
-end
+find_subpkg_path(project_path::String, name::String) = find_ext_path(project_path, name, "sub")
 
 # `where` is a subpackage of `parent`, whose (parsed) project file is `d`: what does `name` mean in it?
 function subpackage_dep_get(d::Dict{String, Any}, parent::PkgId, where::PkgId, name::String)::PkgId
@@ -1388,16 +1379,10 @@ function explicit_manifest_deps_get(project_file::String, where::PkgId, name::St
     # `where` is not a package or an extension in this environment. It may be a subpackage of
     # one, which its manifest entry lists. This is a second pass so that ordinary lookups do
     # not pay for it.
-    for (dep_name, entries) in d
-        for entry in entries::Vector{Any}
-            entry = entry::Dict{String, Any}
-            subs = get(entry, "subpackages", nothing)
-            (subs isa Dict{String, Any} && haskey(subs, where.name)) || continue
-            uuid = get(entry, "uuid", nothing)::Union{String, Nothing}
-            uuid === nothing && continue
-            dep = manifest_entry_subpackage_dep_get(d, PkgId(UUID(uuid), dep_name), entry, where, name)
-            dep === nothing || return dep
-        end
+    owner = manifest_owner_entry(d, where)
+    if owner !== nothing
+        dep = manifest_entry_subpackage_dep_get(d, owner[1], owner[2], where, name)
+        dep === nothing || return dep
     end
 
     # We did not find `where` in this environment, either as a package, an extension or
@@ -1422,39 +1407,23 @@ function explicit_manifest_uuid_load_spec(project_file::String, pkg::PkgId)::Uni
             end
         end
     end
-    # Extensions
+    # Extensions and subpackages, which the manifest entry of their parent lists
     for (name, entries) in d
         entries = entries::Vector{Any}
         for entry in entries
             entry = entry::Dict{String, Any}
             uuid = get(entry, "uuid", nothing)::Union{Nothing, String}
-            extensions = get(entry, "extensions", nothing)::Union{Nothing, Dict{String, Any}}
-            if extensions !== nothing && haskey(extensions, pkg.name) && uuid !== nothing && uuid5(UUID(uuid), pkg.name) == pkg.uuid
+            uuid === nothing && continue
+            for (key, dir) in (("extensions", "ext"), ("subpackages", "sub"))
+                children = get(entry, key, nothing)
+                (children isa Dict{String, Any} && haskey(children, pkg.name) && uuid5(UUID(uuid), pkg.name) == pkg.uuid) || continue
                 parent_load_spec = explicit_manifest_entry_load_spec(manifest_file, PkgId(UUID(uuid), name), entry)
-                if parent_load_spec === nothing || parent_load_spec === missing
+                if !(parent_load_spec isa PkgLoadSpec)
                     error("failed to find source of parent package: \"$name\"")
                 end
-                parent_path = parent_load_spec.path
-                p = normpath(dirname(parent_path), "..")
-                return PkgLoadSpec(find_ext_path(p, pkg.name), parent_load_spec.julia_edition)
+                p = normpath(dirname(parent_load_spec.path), "..")
+                return PkgLoadSpec(find_ext_path(p, pkg.name, dir), parent_load_spec.julia_edition)
             end
-        end
-    end
-    # Subpackages, which the manifest entry of their parent lists
-    for (name, entries) in d
-        entries = entries::Vector{Any}
-        for entry in entries
-            entry = entry::Dict{String, Any}
-            subs = get(entry, "subpackages", nothing)
-            (subs isa Dict{String, Any} && haskey(subs, pkg.name)) || continue
-            uuid = get(entry, "uuid", nothing)::Union{Nothing, String}
-            (uuid !== nothing && uuid5(UUID(uuid), pkg.name) == pkg.uuid) || continue
-            parent_load_spec = explicit_manifest_entry_load_spec(manifest_file, PkgId(UUID(uuid), name), entry)
-            if !(parent_load_spec isa PkgLoadSpec)
-                error("failed to find source of parent package: \"$name\"")
-            end
-            p = normpath(dirname(parent_load_spec.path), "..")
-            return PkgLoadSpec(find_subpkg_path(p, pkg.name), parent_load_spec.julia_edition)
         end
     end
     return nothing
@@ -2092,19 +2061,11 @@ function subpackage_autoload_triggers(d::Dict{String, Any}, name::String)::Union
         all(x -> x isa String, autoload) && return String[x::String for x in autoload]
     elseif autoload === true
         weakdeps = get(Dict{String, Any}, d, "weakdeps")::Dict{String, Any}
+        # siblings do not trigger, but their weakdeps do
         triggers = String[]
-        seen = Set{String}()
-        todo = String[name]
-        while !isempty(todo)
-            sub = pop!(todo)
-            sub in seen && continue
-            push!(seen, sub)
+        for sub in Iterators.flatten(((name,), subpackage_sibling_closure(d, name)))
             for dep in something(subpackage_deps(d, sub), String[])
-                if subpackage_deps(d, dep) !== nothing
-                    push!(todo, dep)       # sibling: it does not trigger, but its weakdeps do
-                elseif haskey(weakdeps, dep) && !(dep in triggers)
-                    push!(triggers, dep)
-                end
+                haskey(weakdeps, dep) && !(dep in triggers) && push!(triggers, dep)
             end
         end
         return triggers
@@ -2144,15 +2105,18 @@ function insert_subpackage_triggers(env::String, pkg::PkgId)
     d === nothing && return
     subs = get(d, "subpackages", nothing)::Union{Nothing, Dict{String, Any}}
     subs === nothing && return
-    totaldeps = merge(get(Dict{String, Any}, d, "weakdeps")::Dict{String, Any},
-                      get(Dict{String, Any}, d, "deps")::Dict{String, Any})
     autoloads = Dict{String, Any}()
     selected = missing
+    totaldeps = nothing
     for name in keys(subs)
         triggers = subpackage_autoload_triggers(d, name)
         triggers === nothing && continue
         # only the subpackages that the environment uses are installed and autoload
-        selected === missing && (selected = environment_subpackage_selection(env, pkg, d))
+        if selected === missing
+            selected = environment_subpackage_selection(env, pkg, d)
+            totaldeps = merge(get(Dict{String, Any}, d, "weakdeps")::Dict{String, Any},
+                              get(Dict{String, Any}, d, "deps")::Dict{String, Any})
+        end
         selected === nothing || name in selected || continue
         unknown = filter(t -> !haskey(totaldeps, t), triggers)
         if !isempty(unknown)
@@ -2162,7 +2126,8 @@ function insert_subpackage_triggers(env::String, pkg::PkgId)
         end
         autoloads[name] = triggers
     end
-    isempty(autoloads) || _insert_extension_triggers(pkg, autoloads, totaldeps)
+    isempty(autoloads) && return
+    _insert_extension_triggers(pkg, autoloads, totaldeps::Dict{String, Any})
     for name in keys(autoloads)
         siblings = PkgId[PkgId(uuid5(pkg.uuid::UUID, s), s) for s in subpackage_sibling_closure(d, name)]
         isempty(siblings) || (SUBPKG_AUTOLOAD_SIBLINGS[PkgId(uuid5(pkg.uuid::UUID, name), name)] = siblings)
@@ -2495,8 +2460,8 @@ function package_subdeps_source(env::String, where::PkgId, entry_path::String)
     return parsed_toml(project_file), project_file
 end
 
-# Like `package_root_project_file`, but also for extensions and subpackages in a
-# directory of their own (`ext/Foo/Foo.jl`, `sub/Foo/Foo.jl`)
+# The Project.toml at the root of the package whose entry point is `entry_path` (`src/Pkg.jl`),
+# also for extensions and subpackages in a directory of their own (`ext/Foo/Foo.jl`, `sub/Foo/Foo.jl`)
 function package_root_project_file_for_entry(entry_path::String)::Union{Nothing, String}
     dir = dirname(entry_path)
     if basename(dirname(dir)) in ("ext", "sub")

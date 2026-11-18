@@ -2687,7 +2687,7 @@ function parse_import(ps::ParseState, word, has_import_prefix)
     mark = position(ps)
     parse_import_path(ps)
     if peek(ps) == K"::" && !preceding_whitespace(peek_token(ps))
-        # Subpackages, in every syntax version
+        # Subpackages
         # using A::B       ==>  (using (:: (importpath A) B))
         # using A :: B     ==>  (::-i (using (importpath A)) B)
         # import A::B as C ==>  (import (as (:: (importpath A) B) C))

@@ -1081,17 +1081,11 @@ function visit_indirect_deps!(direct_deps::Dict{PkgId, Vector{PkgId}}, visited::
     return
 end
 
-# Build dependency graph from an ExplicitEnv.
-# Returns a NamedTuple of (direct_deps, ext_to_parent, parent_to_exts, triggers, project_deps, serial_deps).
-# Add nodes for the subpackages `selected` of `pkg` and for the sibling subpackages they need.
+# Add nodes for the subpackages `names` of `pkg` (closed under the siblings they need).
 # A subpackage may load the parent, the parent's deps and the weakdeps and siblings it lists
 # (from the parent's manifest entry, `d`).
 function add_subpackage_nodes!(direct_deps::Dict{PkgId, Vector{PkgId}}, parent_to_subs::Dict{PkgId, Vector{PkgId}},
-                               pkg::PkgId, d::Dict{String, Any}, selected::Vector{String}, pkg_uuids::Set{UUID})
-    names = Set{String}(selected)
-    for sub in selected
-        union!(names, Base.subpackage_sibling_closure(d, sub))
-    end
+                               pkg::PkgId, d::Dict{String, Any}, names::Set{String}, pkg_uuids::Set{UUID})
     weakdeps = get(Dict{String, Any}, d, "weakdeps")::Dict{String, Any}
     subs = PkgId[]
     for name in names
@@ -1113,6 +1107,8 @@ function add_subpackage_nodes!(direct_deps::Dict{PkgId, Vector{PkgId}}, parent_t
     return
 end
 
+# Build dependency graph from an ExplicitEnv.
+# Returns a NamedTuple of (direct_deps, ext_to_parent, parent_to_exts, triggers, project_deps, serial_deps).
 function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, requested_pkgids::Vector{PkgId})
     direct_deps = Dict{PkgId, Vector{PkgId}}()
     parent_to_exts = Dict{PkgId, Vector{PkgId}}()
@@ -1177,11 +1173,11 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
         haskey(direct_deps, pkg) || continue
         d = env.subpackage_defs[dep]
         selected = get(Vector{String}, env.subpackages, dep)
+        isempty(selected) && continue
         autoloads = Dict{PkgId, Vector{PkgId}}()
         weakdeps_d = get(Dict{String, Any}, d, "weakdeps")::Dict{String, Any}
         deps_d = get(Dict{String, Any}, d, "deps")::Dict{String, Any}
-        # only explicitly selected subpackages (and the siblings they need) hold up the
-        # dependents of the parent; autoloaded ones are waited for like extensions
+        # the selected subpackages and the siblings they need
         explicit = Set{String}(selected)
         for sub in selected
             union!(explicit, Base.subpackage_sibling_closure(d, sub))
@@ -1203,13 +1199,7 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
             length(trigger_ids) == 1 + length(trigger_names) || continue
             autoloads[PkgId(Base.uuid5(dep, name), name)] = trigger_ids
         end
-        isempty(selected) && isempty(autoloads) && continue
-        add_subpackage_nodes!(direct_deps, parent_to_subs, pkg, d,
-                              union(selected, String[id.name for id in keys(autoloads)]), pkg_uuids)
-        if haskey(parent_to_subs, pkg)
-            filter!(id -> id.name in explicit, parent_to_subs[pkg])
-            isempty(parent_to_subs[pkg]) && delete!(parent_to_subs, pkg)
-        end
+        add_subpackage_nodes!(direct_deps, parent_to_subs, pkg, d, explicit, pkg_uuids)
         for (id, trigger_ids) in autoloads
             haskey(direct_deps, id) || continue
             ext_to_parent[id] = pkg
@@ -1279,12 +1269,13 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
         end
         for ext in keys(ext_to_parent)
             ext_loadable_in_pkg = Dict{PkgId,Bool}()
+            ext_triggers = filter(!Base.in_sysimage, triggers[ext])
             for pkg in keys(direct_deps)
                 # (an autoloaded subpackage may depend on more than its triggers, and is not
                 # loadable in the packages it depends on itself)
                 is_dependency = pkg == ext || in(pkg, indirect_deps[ext])
                 is_extension = in(pkg, keys(ext_to_parent))
-                has_triggers = all(t -> Base.in_sysimage(t) || t in indirect_deps[pkg], triggers[ext])
+                has_triggers = issubset(ext_triggers, indirect_deps[pkg])
                 ext_loadable_in_pkg[pkg] = !is_extension && has_triggers && !is_dependency
             end
             for (pkg, ext_loadable) in ext_loadable_in_pkg

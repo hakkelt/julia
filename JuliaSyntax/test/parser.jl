@@ -864,9 +864,8 @@ tests = [
         "import A::B as C"  => "(import (as (:: (importpath A) B) C))"
         "using A::B: x, y"  => "(using (: (:: (importpath A) B) (importpath x) (importpath y)))"
         "using A:: B"       => "(using (:: (importpath A) (error)))"
-        # in every syntax version; with whitespace, `::` is left to the enclosing statement,
-        # where it is a type assertion
         ((v=v"1.10",), "using A::B") => "(using (:: (importpath A) B))"
+        # with whitespace, `::` is left to the enclosing statement, where it is a type assertion
         "using A :: B"      => "(using (importpath A))"
         "using A::{B, C}"   => "(using (:: (importpath A) (braces B C)))"
         "using A::{B,}"     => "(using (:: (importpath A) (braces B)))"
