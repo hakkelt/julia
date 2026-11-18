@@ -1938,14 +1938,14 @@ function insert_extension_triggers(env::String, pkg::PkgId)::Union{Nothing,Missi
         owner = manifest_owner_entry(manifest_file, d, pkg)
         (owner === nothing || owner[3] !== nothing) && return nothing
         entry = owner[2]
-        sub_d = manifest_entry_subpackage_dict(d, entry)
-        sub_d === nothing || insert_subpackage_triggers(env, pkg, sub_d)
         if get(entry, "path", nothing) === nothing && get(entry, "git-tree-sha1", nothing) === nothing
             # a stdlib entry is loaded from Sys.STDLIB (see `explicit_manifest_uuid_path`), and
             # the manifest may have been resolved by a Julia version whose copy of the stdlib
             # had different extensions, so take them from the stdlib's own Project.toml
             return insert_extension_triggers(Sys.STDLIB, pkg)
         end
+        sub_d = manifest_entry_subpackage_dict(d, entry)
+        sub_d === nothing || insert_subpackage_triggers(env, pkg, sub_d)
         extensions = get(entry, "extensions", nothing)::Union{Nothing, Dict{String, Any}}
         extensions === nothing && return
         weakdeps = manifest_dep_names(get(Dict{String, Any}, entry, "weakdeps"))::Union{Vector{String}, Dict{String,Any}}
@@ -2381,7 +2381,7 @@ function subpackage_declared(where::PkgId, parent::PkgId, sub::String, env::Unio
         d = parsed_toml(project_file)
         # the workspace of the parent is its own environment, which uses all its subpackages
         requests = environment_subpackage_requests(project_file)
-        haskey(requests, parent.uuid::UUID) && requests[parent.uuid::UUID] === nothing && return true, nothing
+        get(requests, parent.uuid::UUID, missing) === nothing && return true, nothing
     else
         specenv = locate_package_env(where)
         specenv === nothing && return false, nothing
