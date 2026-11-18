@@ -664,13 +664,6 @@ function ExplicitEnv(envpath::String)
     lookup_strategy = Dict{UUID, Union{SHA1, String, Nothing, Missing}}()
     subpackages = Dict{UUID, Vector{String}}()
     subpackage_defs = Dict{UUID, Dict{String, Any}}()
-    # [subdeps] of the project and of the packages in the manifest, with the uuids of the
-    # dependencies they name
-    subdeps_requests = Tuple{Dict{String, Any}, Dict{String, Any}}[]
-    subdeps_d = get(project_d, "subdeps", nothing)
-    if subdeps_d isa Dict{String, Any}
-        push!(subdeps_requests, (subdeps_d, Dict{String, Any}(k => string(v) for (k, v) in project_name_to_uuid)))
-    end
     manifest_deps_d = get_deps(manifest_d)
 
     sizehint!(deps, length(manifest_d))
@@ -724,13 +717,9 @@ function ExplicitEnv(envpath::String)
             end
             extensions[m_uuid] = deps_pkg_concrete
 
-            # Subpackages, and the subpackages of its dependencies that this package uses
+            # Subpackages
             sub_d = Base.manifest_entry_subpackage_dict(manifest_deps_d, pkg_info)
             sub_d === nothing || (subpackage_defs[m_uuid] = sub_d)
-            subdeps_d = get(pkg_info, "subdeps", nothing)
-            if subdeps_d isa Dict{String, Any}
-                push!(subdeps_requests, (subdeps_d, Base.manifest_expand_deps(manifest_deps_d, get(pkg_info, "deps", nothing))))
-            end
 
             # Determine strategy to find package
             lookup_strat = begin
@@ -808,38 +797,20 @@ function ExplicitEnv(envpath::String)
         extensions_expanded[pkg] = exts_expanded
     end
 
-    # The other projects in the workspace select subpackages in their [subdeps] too. A
-    # package's own environment, where it is the active project or a member of the
-    # workspace, uses all of its subpackages (see `Base.environment_subpackage_selection`).
+    # The members of the workspace with subpackages are in the manifest only if something in
+    # the workspace depends on them
     for file in Base.workspace_project_files(envpath)
         member_d = parsed_toml(file)
-        member_subdeps = get(member_d, "subdeps", nothing)
-        if file != envpath && member_subdeps isa Dict{String, Any}
-            member_deps = merge(get(Dict{String, Any}, member_d, "deps")::Dict{String, Any},
-                                get(Dict{String, Any}, member_d, "weakdeps")::Dict{String, Any})
-            push!(subdeps_requests, (member_subdeps, member_deps))
-        end
-        member_subs = get(member_d, "subpackages", nothing)
         member_uuid = get(member_d, "uuid", nothing)
-        (member_subs isa Dict{String, Any} && member_uuid isa String) || continue
-        member_uuid = UUID(member_uuid)
-        # a member that something in the workspace depends on is in the manifest too
-        get!(subpackage_defs, member_uuid, member_d)
-        selected = get!(Vector{String}, subpackages, member_uuid)
-        for sub in keys(member_subs)
-            sub in selected || push!(selected, sub)
-        end
+        (get(member_d, "subpackages", nothing) isa Dict{String, Any} && member_uuid isa String) || continue
+        get!(subpackage_defs, UUID(member_uuid), member_d)
     end
-
-    for (subdeps_d, dep_uuids) in subdeps_requests
-        for (parent, subs) in subdeps_d
-            uuid = get(dep_uuids, parent, nothing)
-            uuid === nothing && continue
-            selected = get!(Vector{String}, subpackages, UUID(uuid::String))
-            for sub in (subs isa String ? (subs,) : subs::Vector)
-                sub::String in selected || push!(selected, sub)
-            end
-        end
+    # The subpackages in use (see `Base.environment_subpackage_requests`)
+    for (uuid, requested) in Base.environment_subpackage_requests(envpath)
+        d = get(subpackage_defs, uuid, nothing)
+        d === nothing && continue
+        subpackages[uuid] = requested === nothing ?
+            collect(keys(get(Dict{String, Any}, d, "subpackages")::Dict{String, Any})) : collect(requested)
     end
 
     fixup_stdlib_deps!(deps_expanded, weakdeps_expanded, extensions_expanded, names, lookup_strategy)

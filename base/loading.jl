@@ -273,6 +273,7 @@ struct LoadingCache
     identified_where::Dict{Tuple{PkgId, String}, Union{Nothing, Tuple{PkgId, String}}}
     identified::Dict{String, Union{Nothing, Tuple{PkgId, String}}}
     located::Dict{Tuple{PkgId, Union{String, Nothing}}, Union{Tuple{PkgLoadSpec, String}, Nothing}}
+    subpackage_requests::Dict{String, Dict{UUID, Union{Nothing, Set{String}}}}
 end
 const LOADING_CACHE = Ref{Union{LoadingCache, Nothing}}(nothing) # n.b.: all access to and through this are protected by require_lock
 LoadingCache() = LoadingCache(
@@ -283,7 +284,8 @@ LoadingCache() = LoadingCache(
     Set{String}(),
     Dict{Tuple{PkgId, String}, Union{Nothing, Tuple{PkgId, String}}}(),
     Dict{String, Union{Nothing, Tuple{PkgId, String}}}(),
-    Dict{Tuple{PkgId, Union{String, Nothing}}, Union{Tuple{PkgLoadSpec, String}, Nothing}}()
+    Dict{Tuple{PkgId, Union{String, Nothing}}, Union{Tuple{PkgLoadSpec, String}, Nothing}}(),
+    Dict{String, Dict{UUID, Union{Nothing, Set{String}}}}()
 )
 
 
@@ -2073,32 +2075,38 @@ function insert_subpackage_triggers(env::String, pkg::PkgId, d::Dict{String, Any
     return
 end
 
-# The subpackages of `pkg` (with subpackage definitions `d`) that environment `env` uses,
-# with the sibling subpackages they need, or `nothing` for all of them. A project uses the
-# subpackages that the [subdeps] of the projects in its workspace or of the packages in its
-# manifest list. The package's own environment (it is the active project or a member of
-# its workspace) uses all of them, and so does an implicit environment.
-function environment_subpackage_selection(env::String, pkg::PkgId, d::Dict{String, Any})::Union{Nothing, Set{String}}
-    project_file = env_project_file(env)
-    project_file isa String || return nothing
-    puuid = string(pkg.uuid)
-    selected = Set{String}()
+# The subpackages that the environment of `project_file` uses, by the uuid of their parent:
+# those that the [subdeps] of the projects in its workspace and of the packages in its manifest
+# name. A package's own environment (it is the active project or a member of its workspace)
+# uses all of its subpackages, marked `nothing`. Callers add the sibling subpackages that
+# these need (see `subpackage_sibling_closure`). Shared by loading and precompilation.
+function environment_subpackage_requests(project_file::String)::Dict{UUID, Union{Nothing, Set{String}}}
+    cache = LOADING_CACHE[]
+    if cache !== nothing
+        cached = get(cache.subpackage_requests, project_file, nothing)
+        cached === nothing || return cached
+    end
+    requests = Dict{UUID, Union{Nothing, Set{String}}}()
     function add!(subdeps, deps)
         subdeps isa Dict{String, Any} || return
         for (name, subs) in subdeps
-            get(deps, name, nothing) == puuid || continue
-            if subs isa String
-                push!(selected, subs)
-            elseif subs isa Vector
-                for sub in subs
-                    sub isa String && push!(selected, sub)
-                end
+            uuid = get(deps, name, nothing)
+            uuid isa String || continue
+            uuid = UUID(uuid)
+            selected = get!(Set{String}, requests, uuid)
+            selected === nothing && continue
+            for sub in (subs isa Vector ? subs : (subs,))
+                sub isa String && push!(selected, sub)
             end
         end
     end
-    for file in workspace_project_files(project_file)
+    files = workspace_project_files(project_file)
+    for file in files
+        uuid = get(parsed_toml(file), "uuid", nothing)
+        uuid isa String && (requests[UUID(uuid)] = nothing)
+    end
+    for file in files
         p = parsed_toml(file)
-        get(p, "uuid", nothing) == puuid && return nothing
         deps = merge(get(Dict{String, Any}, p, "deps")::Dict{String, Any},
                      get(Dict{String, Any}, p, "weakdeps")::Dict{String, Any})
         add!(get(p, "subdeps", nothing), deps)
@@ -2115,7 +2123,20 @@ function environment_subpackage_selection(env::String, pkg::PkgId, d::Dict{Strin
             end
         end
     end
-    for sub in collect(selected)
+    cache === nothing || (cache.subpackage_requests[project_file] = requests)
+    return requests
+end
+
+# The subpackages of `pkg` (with subpackage definitions `d`) that environment `env` uses,
+# with the sibling subpackages they need, or `nothing` for all of them (see
+# `environment_subpackage_requests`). An implicit environment uses all of them.
+function environment_subpackage_selection(env::String, pkg::PkgId, d::Dict{String, Any})::Union{Nothing, Set{String}}
+    project_file = env_project_file(env)
+    project_file isa String || return nothing
+    requested = get(environment_subpackage_requests(project_file), pkg.uuid::UUID, Set{String}())
+    requested === nothing && return nothing
+    selected = copy(requested)
+    for sub in requested
         union!(selected, subpackage_sibling_closure(d, sub))
     end
     return selected
@@ -2359,9 +2380,8 @@ function subpackage_declared(where::PkgId, parent::PkgId, sub::String, env::Unio
         project_file isa String || return true, nothing
         d = parsed_toml(project_file)
         # the workspace of the parent is its own environment, which uses all its subpackages
-        for file in workspace_project_files(project_file)
-            get(parsed_toml(file), "uuid", nothing) == string(parent.uuid) && return true, nothing
-        end
+        requests = environment_subpackage_requests(project_file)
+        haskey(requests, parent.uuid::UUID) && requests[parent.uuid::UUID] === nothing && return true, nothing
     else
         specenv = locate_package_env(where)
         specenv === nothing && return false, nothing
