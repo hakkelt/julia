@@ -265,6 +265,7 @@ Base.@kwdef mutable struct PrecompileSession
     direct_deps::Dict{PkgId, Vector{PkgId}}
     ext_to_parent::Dict{PkgId, PkgId}
     parent_to_exts::Dict{PkgId, Vector{PkgId}}
+    sub_to_parent::Dict{PkgId, PkgId}  # subpackages (also autoloaded ones) => their parent
     triggers::Dict{PkgId, Vector{PkgId}}
     project_deps::Vector{PkgId}
     serial_deps::Vector{PkgId}
@@ -796,8 +797,12 @@ function ExplicitEnv(envpath::String)
             sizehint!(triggers_expanded, length(triggers))
             sub_d = get(subpackage_defs, pkg, nothing)
             for trigger in triggers
-                if sub_d !== nothing && Base.subpackage_deps(sub_d, trigger) !== nothing
-                    # a subpackage of the package itself
+                # a subpackage of the package itself (its dependencies take precedence, as in
+                # `Base.insert_extension_triggers`: Pkg and registries reject a subpackage
+                # named like a dependency)
+                if sub_d !== nothing && Base.subpackage_deps(sub_d, trigger) !== nothing &&
+                        !haskey(sub_d["deps"]::Dict{String, Any}, trigger) &&
+                        !haskey(sub_d["weakdeps"]::Dict{String, Any}, trigger)
                     uuid = Base.uuid5(pkg, trigger)
                     names[uuid] = trigger
                     push!(triggers_expanded, uuid)
@@ -961,13 +966,20 @@ end
 ## Dependency graph
 
 # name or parent → ext
-function full_name(ext_to_parent::Dict{PkgId, PkgId}, pkg::PkgId)
-    if haskey(ext_to_parent, pkg)
+function full_name(ext_to_parent::Dict{PkgId, PkgId}, pkg::PkgId,
+                   sub_to_parent::Dict{PkgId, PkgId} = Dict{PkgId, PkgId}())
+    if haskey(sub_to_parent, pkg)
+        # written as in `using Parent::Sub`: a subpackage may well be named like an
+        # unrelated package (the one it replaced, for instance)
+        return string(sub_to_parent[pkg].name, "::", pkg.name)
+    elseif haskey(ext_to_parent, pkg)
         return string(ext_to_parent[pkg].name, " → ", pkg.name)
     else
         return pkg.name
     end
 end
+
+full_name(s, pkg::PkgId) = full_name(s.ext_to_parent, pkg, s.sub_to_parent)
 
 function excluded_circular_deps_explanation(io::IOContext, ext_to_parent::Dict{PkgId, PkgId}, circular_deps, cycles)
     outer_deps = copy(circular_deps)
@@ -1092,7 +1104,7 @@ function add_subpackage_nodes!(direct_deps::Dict{PkgId, Vector{PkgId}}, parent_t
 end
 
 # Build dependency graph from an ExplicitEnv.
-# Returns a NamedTuple of (direct_deps, ext_to_parent, parent_to_exts, triggers, project_deps, serial_deps).
+# Returns a NamedTuple of (direct_deps, ext_to_parent, parent_to_exts, sub_to_parent, triggers, project_deps, serial_deps).
 function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, requested_pkgids::Vector{PkgId})
     direct_deps = Dict{PkgId, Vector{PkgId}}()
     parent_to_exts = Dict{PkgId, Vector{PkgId}}()
@@ -1300,7 +1312,14 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
         end
     end
 
-    return (; direct_deps, ext_to_parent, parent_to_exts, triggers, project_deps, serial_deps)
+    sub_to_parent = Dict{PkgId, PkgId}(sub => parent for (parent, subs) in parent_to_subs for sub in subs)
+    for (ext, parent) in ext_to_parent
+        # autoloaded subpackages (and not extensions)
+        d = get(env.subpackage_defs, parent.uuid::UUID, nothing)
+        (d === nothing || Base.subpackage_deps(d, ext.name) === nothing) && continue
+        sub_to_parent[ext] = parent
+    end
+    return (; direct_deps, ext_to_parent, parent_to_exts, sub_to_parent, triggers, project_deps, serial_deps)
 end
 
 # Detect circular dependencies and notify their Events so waiting tasks can skip them.
@@ -2364,7 +2383,7 @@ function make_signal_channel()
 end
 
 function describe_pkg(s::PrecompileSession, pkg::PkgId, is_project_dep::Bool, is_serial_dep::Bool, flags::Cmd, cacheflags::Base.CacheFlags)
-    name = full_name(s.ext_to_parent, pkg)
+    name = full_name(s, pkg)
     name = is_project_dep ? name : color_string(name, :light_black, s.hascolor)
     if is_serial_dep
         name *= color_string(" (serial)", :light_black, s.hascolor)
@@ -2440,7 +2459,7 @@ function loaded_version_conflicts(s::PrecompileSession, pkgs)
         haskey(s.direct_deps, pkg) && collect_all_deps(s.direct_deps, pkg, deps)
     end
     conflicts = PkgId[pkg for pkg in deps if pkg in s.start_loaded_modules && loaded_version_differs(pkg)]
-    return sort!([full_name(s.ext_to_parent, pkg) for pkg in conflicts])
+    return sort!([full_name(s, pkg) for pkg in conflicts])
 end
 
 # The version the loader uses for `pkg`: the loaded one, or else the one in the first
@@ -2703,7 +2722,7 @@ function precompilepkgs_monitor_std(s::PrecompileSession, pkg_config, job::Preco
         if !thistaskwaiting && occursin("Waiting for background task / IO / timer", str)
             thistaskwaiting = true
             !liveprinting && !s.fancyprint && BG.monitoring && @lock s.print_lock begin
-                println(s.io, full_name(s.ext_to_parent, pkg), color_string(str, Base.warn_color(), s.hascolor))
+                println(s.io, full_name(s, pkg), color_string(str, Base.warn_color(), s.hascolor))
             end
             job.waiting_for_bg = true
         elseif !thistaskwaiting
@@ -2830,7 +2849,7 @@ function failed_dependency(s::PrecompileSession, deps::Vector{PkgId}, config::Co
     for dep in deps
         job = @lock s.print_lock get(s.jobs, (dep, config), nothing)
         job === nothing && continue
-        is_failed(job) && had_pid(job) && return full_name(s.ext_to_parent, dep)
+        is_failed(job) && had_pid(job) && return full_name(s, dep)
         is_dep_failed(job) && return job.error_msg
     end
     return nothing
@@ -2970,7 +2989,7 @@ function spawn_precompile_tasks!(s::PrecompileSession;
                                                   preresolved=preresolved_snapshot(s))
                             end
                         else
-                            fullname = full_name(s.ext_to_parent, pkg)
+                            fullname = full_name(s, pkg)
                             Base.errormonitor(Threads.@spawn :samepool begin
                                 pid = try; take!(pid_ch); catch; Int32(0); end
                                 pid > 0 && @lock s.print_lock set_pid!(job, pid)
@@ -3113,6 +3132,7 @@ function drain_work_channel!(s::PrecompileSession, work_channel::Channel{Precomp
                     merge!(s.direct_deps, new_graph.direct_deps)
                     merge!(s.ext_to_parent, new_graph.ext_to_parent)
                     merge!(s.parent_to_exts, new_graph.parent_to_exts)
+                    merge!(s.sub_to_parent, new_graph.sub_to_parent)
                     merge!(s.triggers, new_graph.triggers)
                     union!(s.project_deps, new_graph.project_deps)
                     union!(s.serial_deps, new_graph.serial_deps)
@@ -3261,7 +3281,7 @@ function report_precompile_results!(s::PrecompileSession)
                     elseif isempty(s.requested_pkgids) || s.requested_all
                         "packages finished."
                     else
-                        "$(join((full_name(s.ext_to_parent, p) for p in s.requested_pkgids), ", ", " and ")) finished."
+                        "$(join((full_name(s, p) for p in s.requested_pkgids), ", ", " and ")) finished."
                     end
                     printpkgstyle(iostr, :Precompiling, what)
                 end
@@ -3274,12 +3294,12 @@ function report_precompile_results!(s::PrecompileSession)
                     print(iostr, ".")
                 end
                 if s.n_loaded > 0
-                    loaded_names_vec = sort!([full_name(s.ext_to_parent, p) for p in s.loaded_pkgs])
+                    loaded_names_vec = sort!([full_name(s, p) for p in s.loaded_pkgs])
                     if s._from_loading && !s.ignore_loaded
                         # loading compiles dependents for the loaded version, so the loaded
                         # package is the reason for this session rather than its result;
                         # say so here for those not already explained under the header
-                        differing = sort!([full_name(s.ext_to_parent, p) for p in s.loaded_pkgs if loaded_version_differs(p)])
+                        differing = sort!([full_name(s, p) for p in s.loaded_pkgs if loaded_version_differs(p)])
                         unexplained = setdiff(differing, s.explained_conflicts)
                         if !isempty(unexplained)
                             print(iostr, "\n", loaded_conflicts_message(unexplained, s.hascolor; ongoing=false, cancelable=false))
@@ -3391,7 +3411,7 @@ function report_precompile_results!(s::PrecompileSession)
                         else
                             join(split(err, "\n"), color_string("\n│  ", Base.warn_color(), s.hascolor))
                         end
-                        name = full_name(s.ext_to_parent, pkg)
+                        name = full_name(s, pkg)
                         print(iostr, color_string("\n┌ ", Base.warn_color(), s.hascolor), name, color_string("\n│  ", Base.warn_color(), s.hascolor), err, color_string("\n└  ", Base.warn_color(), s.hascolor))
                     end
                 end
@@ -3406,7 +3426,7 @@ function report_precompile_results!(s::PrecompileSession)
         for ((dep, config), job) in s.jobs
             is_failed(job) || continue
             write(err_str, "\n")
-            print(err_str, "\n", full_name(s.ext_to_parent, dep), " ")
+            print(err_str, "\n", full_name(s, dep), " ")
             join(err_str, config[1], " ")
             print(err_str, "\n", job.error_msg)
         end
@@ -3589,7 +3609,7 @@ function do_precompile(pkgs::Union{Vector{String}, Vector{PkgId}},
         start_loaded_modules=Set{PkgId}(keys(Base.loaded_modules)), requested_pkgids, requested_all,
         direct_deps=graph.direct_deps,
         ext_to_parent=graph.ext_to_parent, parent_to_exts=graph.parent_to_exts,
-        triggers=graph.triggers, project_deps=graph.project_deps,
+        sub_to_parent=graph.sub_to_parent, triggers=graph.triggers, project_deps=graph.project_deps,
         serial_deps=graph.serial_deps, circular_deps,
         n_total=length(graph.direct_deps) * nconfigs,
         printloop_should_exit=!fancyprint, target,

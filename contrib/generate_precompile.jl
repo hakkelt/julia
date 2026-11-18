@@ -134,6 +134,14 @@ precompile(Tuple{Type{Base.VersionNumber}, Int32, Int32, Int32})
 # Presence tested in the tests
 precompile(Tuple{typeof(Base.print), Base.IOStream, String})
 
+# subpackages: reading the subpackage definitions of a manifest entry
+# (`manifest_entry_subpackage_dict`), whose `deps` and `weakdeps` are a list or a table
+precompile(Tuple{typeof(Base.manifest_expand_deps), Base.Dict{String, Any}, Base.Dict{String, Any}})
+precompile(Tuple{typeof(Base.manifest_expand_deps), Base.Dict{String, Any}, Vector{String}})
+precompile(Tuple{typeof(Base.manifest_expand_deps), Base.Dict{String, Any}, Vector{Any}})
+precompile(Tuple{typeof(Base.manifest_expand_deps), Base.Dict{String, Any}, Nothing})
+precompile(Tuple{typeof(in), String, Vector{String}})
+
 # precompilepkgs
 precompile(Tuple{typeof(Base.get), Type{Array{String, 1}}, Base.Dict{String, Any}, String})
 precompile(Tuple{typeof(Base.get), Type{Base.Dict{String, Any}}, Base.Dict{String, Any}, String})

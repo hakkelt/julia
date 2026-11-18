@@ -1996,6 +1996,18 @@ inline(val) = val == 1 ? `--inline=yes` : `--inline=no`
         @test out == "falsefalsetrue"
     end
 
+    @testset "precompilation names subpackages as `Parent::Sub`" begin
+        out, outerr, ok = run_subpkg("""
+            io = IOBuffer()
+            Base.Precompilation.precompilepkgs(; io, timing = true)
+            print(String(take!(io)))
+            """)
+        @test ok
+        @test occursin("Solvers::Tsit5", out)
+        @test occursin("Solvers::Plots", out)  # autoloaded
+        @test !occursin("Solvers → Plots", out)
+    end
+
     @testset "a subpackage triggers an extension of its parent" begin
         # an extension of the parent that names one of its subpackages among its triggers
         # extends that subpackage: it loads once the subpackage and the other triggers are
