@@ -1075,26 +1075,47 @@ function manifest_expand_deps(d::Dict{String, Any}, deps)::Dict{String, Any}
     return expanded
 end
 
-# The manifest entry in `d` of package `pkg`, or of the package that `pkg` is an extension
-# or subpackage of, with that package's id
-function manifest_owner_entry(d::Dict{String, Any}, pkg::PkgId)::Union{Nothing, Tuple{PkgId, Dict{String, Any}}}
+# The manifest entry in `d` (the deps of `manifest_file`) of package `pkg`, or of the package
+# that `pkg` is an extension or subpackage of: `(id, entry, key)`, with the id of the package
+# the entry is for and `key` nothing, "extensions" or "subpackages".
+function manifest_owner_entry(manifest_file::String, d::Dict{String, Any}, pkg::PkgId)::Union{Nothing, Tuple{PkgId, Dict{String, Any}, Union{Nothing, String}}}
     pkg.uuid === nothing && return nothing
-    for (name, entries) in d
-        for entry in entries::Vector{Any}
-            entry = entry::Dict{String, Any}
-            uuid = get(entry, "uuid", nothing)::Union{Nothing, String}
-            uuid === nothing && continue
-            id = PkgId(UUID(uuid), name)
-            id == pkg && return id, entry
-            for key in ("extensions", "subpackages")
-                children = get(entry, key, nothing)
-                if children isa Dict{String, Any} && haskey(children, pkg.name) && uuid5(id.uuid, pkg.name) == pkg.uuid
-                    return id, entry
+    for entry in get(Vector{Any}, d, pkg.name)::Vector{Any}
+        entry = entry::Dict{String, Any}
+        uuid = get(entry, "uuid", nothing)::Union{Nothing, String}
+        uuid !== nothing && UUID(uuid) == pkg.uuid && return pkg, entry, nothing
+    end
+    return get(manifest_child_index(manifest_file, d), pkg.uuid::UUID, nothing)
+end
+
+# Extensions and subpackages have no manifest entry of their own, and their uuids cannot be
+# reversed to their parent's (`uuid5(parent_uuid, name)`): an index from their uuid to their
+# parent's entry, built once per parsed manifest
+const MANIFEST_CHILD_INDEX = Dict{String, Tuple{Dict{String, Any}, Dict{UUID, Tuple{PkgId, Dict{String, Any}, String}}}}()
+
+function manifest_child_index(manifest_file::String, d::Dict{String, Any})
+    @lock require_lock begin
+        cached = get(MANIFEST_CHILD_INDEX, manifest_file, nothing)
+        cached !== nothing && cached[1] === d && return cached[2]
+        index = Dict{UUID, Tuple{PkgId, Dict{String, Any}, String}}()
+        for (name, entries) in d
+            for entry in entries::Vector{Any}
+                entry = entry::Dict{String, Any}
+                uuid = get(entry, "uuid", nothing)::Union{Nothing, String}
+                uuid === nothing && continue
+                id = PkgId(UUID(uuid), name)
+                for key in ("extensions", "subpackages")
+                    children = get(entry, key, nothing)
+                    children isa Dict{String, Any} || continue
+                    for child in keys(children)
+                        index[uuid5(id.uuid::UUID, child)] = (id, entry, key)
+                    end
                 end
             end
         end
+        MANIFEST_CHILD_INDEX[manifest_file] = (d, index)
+        return index
     end
-    return nothing
 end
 
 # find project file's top-level UUID entry (or nothing)
@@ -1313,81 +1334,48 @@ function explicit_manifest_deps_get(project_file::String, where::PkgId, name::St
     manifest_file = project_file_manifest_path(project_file)
     manifest_file === nothing && return nothing # manifest not found--keep searching LOAD_PATH
     d = get_deps(parsed_toml(manifest_file))
-    for (dep_name, entries) in d
-        entries = entries::Vector{Any}
-        for entry in entries
-            entry = entry::Dict{String, Any}
-            uuid = get(entry, "uuid", nothing)::Union{String, Nothing}
-            uuid === nothing && continue
-            # deps is either a list of names (deps = ["DepA", "DepB"]) or
-            # a table of entries (deps = {"DepA" = "6ea...", "DepB" = "55d..."}
-            deps = manifest_dep_names(get(entry, "deps", nothing))::Union{Vector{String}, Dict{String, Any}, Nothing}
-            local dep::Union{Nothing, PkgId}
-            @label resolved begin
-                if UUID(uuid) === where.uuid
-                    dep = dep_stanza_get(deps, name)
-
-                    # We found `where` in this environment, but it did not have a deps entry for
-                    # `name`. This is likely because the dependency was modified without a corresponding
-                    # change to dependency's Project or our Manifest. Return a sentinel here indicating
-                    # that we know the package, but do not know its UUID. The caller will terminate the
-                    # search and provide an appropriate error to the user.
-                    dep === nothing && return PkgId(name)
-                else
-                    # Check if we're trying to load into an extension of this package
-                    extensions = get(entry, "extensions", nothing)
-                    if extensions !== nothing
-                        if haskey(extensions, where.name) && where.uuid == uuid5(UUID(uuid), where.name)
-                            if name == dep_name
-                                # Extension loads its base package
-                                return PkgId(UUID(uuid), name)
-                            end
-                            exts = extensions[where.name]::Union{String, Vector{String}}
-                            # Extensions are allowed to load:
-                            # 1. Any ordinary dep of the parent package
-                            # 2. Any weakdep of the parent package declared as an extension trigger
-                            for deps′ in (ext_may_load_weakdep(exts, name) ?
-                                    (manifest_dep_names(get(entry, "weakdeps", nothing))::Union{Vector{String}, Dict{String, Any}, Nothing}, deps) :
-                                    (deps,))
-                                dep = dep_stanza_get(deps′, name)
-                                dep === nothing && continue
-                                break resolved
-                            end
-                            return PkgId(name)
-                        end
-                    end
-                    continue
-                end
-            end
-
-            dep.uuid !== nothing && return dep
-
-            # We have the dep, but it did not specify a UUID. In this case,
-            # it must be that the name is unique in the manifest - so lookup
-            # the UUID at the top level by name
-            name_deps = get(d, name, nothing)::Union{Nothing, Vector{Any}}
-            if name_deps === nothing || length(name_deps) != 1
-                error("expected a single entry for $(repr(name)) in $(repr(project_file))")
-            end
-            entry = first(name_deps::Vector{Any})::Dict{String, Any}
-            uuid = get(entry, "uuid", nothing)::Union{String, Nothing}
-            uuid === nothing && return PkgId(name)
-            return PkgId(UUID(uuid), name)
-        end
-    end
-
-    # `where` is not a package or an extension in this environment. It may be a subpackage of
-    # one, which its manifest entry lists. This is a second pass so that ordinary lookups do
-    # not pay for it.
-    owner = manifest_owner_entry(d, where)
-    if owner !== nothing
-        dep = manifest_entry_subpackage_dep_get(d, owner[1], owner[2], where, name)
-        dep === nothing || return dep
-    end
-
+    owner = manifest_owner_entry(manifest_file, d, where)
     # We did not find `where` in this environment, either as a package, an extension or
     # a subpackage. The caller should continue searching the environment stack.
-    return nothing
+    owner === nothing && return nothing
+    parent, entry, key = owner
+    key == "subpackages" && return manifest_entry_subpackage_dep_get(d, parent, entry, where, name)
+    # deps is either a list of names (deps = ["DepA", "DepB"]) or
+    # a table of entries (deps = {"DepA" = "6ea...", "DepB" = "55d..."}
+    deps = manifest_dep_names(get(entry, "deps", nothing))::Union{Vector{String}, Dict{String, Any}, Nothing}
+    dep = dep_stanza_get(deps, name)
+    if key == "extensions"
+        # Extension loads its base package
+        name == parent.name && return parent
+        # Extensions are allowed to load:
+        # 1. Any ordinary dep of the parent package
+        # 2. Any weakdep of the parent package declared as an extension trigger
+        exts = entry["extensions"][where.name]::Union{String, Vector{String}}
+        if dep === nothing && ext_may_load_weakdep(exts, name)
+            weakdeps = manifest_dep_names(get(entry, "weakdeps", nothing))::Union{Vector{String}, Dict{String, Any}, Nothing}
+            dep = dep_stanza_get(weakdeps, name)
+        end
+    end
+    # We found `where` in this environment, but it did not have a deps entry for
+    # `name`. This is likely because the dependency was modified without a corresponding
+    # change to dependency's Project or our Manifest. Return a sentinel here indicating
+    # that we know the package, but do not know its UUID. The caller will terminate the
+    # search and provide an appropriate error to the user.
+    dep === nothing && return PkgId(name)
+
+    dep.uuid !== nothing && return dep
+
+    # We have the dep, but it did not specify a UUID. In this case,
+    # it must be that the name is unique in the manifest - so lookup
+    # the UUID at the top level by name
+    name_deps = get(d, name, nothing)::Union{Nothing, Vector{Any}}
+    if name_deps === nothing || length(name_deps) != 1
+        error("expected a single entry for $(repr(name)) in $(repr(project_file))")
+    end
+    entry = first(name_deps::Vector{Any})::Dict{String, Any}
+    uuid = get(entry, "uuid", nothing)::Union{String, Nothing}
+    uuid === nothing && return PkgId(name)
+    return PkgId(UUID(uuid), name)
 end
 
 # find `uuid` stanza, return the corresponding path
@@ -1396,37 +1384,18 @@ function explicit_manifest_uuid_load_spec(project_file::String, pkg::PkgId)::Uni
     manifest_file === nothing && return nothing # no manifest, skip env
 
     d = get_deps(parsed_toml(manifest_file))
-    entries = get(d, pkg.name, nothing)::Union{Nothing, Vector{Any}}
-    if entries !== nothing
-        for entry in entries
-            entry = entry::Dict{String, Any}
-            uuid = get(entry, "uuid", nothing)::Union{Nothing, String}
-            uuid === nothing && continue
-            if UUID(uuid) === pkg.uuid
-                return explicit_manifest_entry_load_spec(manifest_file, pkg, entry)
-            end
-        end
-    end
+    owner = manifest_owner_entry(manifest_file, d, pkg)
+    owner === nothing && return nothing
+    parent, entry, key = owner
+    key === nothing && return explicit_manifest_entry_load_spec(manifest_file, pkg, entry)
     # Extensions and subpackages, which the manifest entry of their parent lists
-    for (name, entries) in d
-        entries = entries::Vector{Any}
-        for entry in entries
-            entry = entry::Dict{String, Any}
-            uuid = get(entry, "uuid", nothing)::Union{Nothing, String}
-            uuid === nothing && continue
-            for (key, dir) in (("extensions", "ext"), ("subpackages", "sub"))
-                children = get(entry, key, nothing)
-                (children isa Dict{String, Any} && haskey(children, pkg.name) && uuid5(UUID(uuid), pkg.name) == pkg.uuid) || continue
-                parent_load_spec = explicit_manifest_entry_load_spec(manifest_file, PkgId(UUID(uuid), name), entry)
-                if !(parent_load_spec isa PkgLoadSpec)
-                    error("failed to find source of parent package: \"$name\"")
-                end
-                p = normpath(dirname(parent_load_spec.path), "..")
-                return PkgLoadSpec(find_ext_path(p, pkg.name, dir), parent_load_spec.julia_edition)
-            end
-        end
+    parent_load_spec = explicit_manifest_entry_load_spec(manifest_file, parent, entry)
+    if !(parent_load_spec isa PkgLoadSpec)
+        error("failed to find source of parent package: \"$(parent.name)\"")
     end
-    return nothing
+    p = normpath(dirname(parent_load_spec.path), "..")
+    dir = key == "extensions" ? "ext" : "sub"
+    return PkgLoadSpec(find_ext_path(p, pkg.name, dir), parent_load_spec.julia_edition)
 end
 
 function explicit_manifest_entry_load_spec(manifest_file::String, pkg::PkgId, entry::Dict{String,Any})::Union{Nothing, Missing, PkgLoadSpec}
@@ -1936,7 +1905,6 @@ function insert_extension_triggers(pkg::PkgId)
 end
 
 function insert_extension_triggers(env::String, pkg::PkgId)::Union{Nothing,Missing}
-    insert_subpackage_triggers(env, pkg)
     project_file = env_project_file(env)
     if project_file isa String || project_file
         implicit_project_file = project_file
@@ -1951,6 +1919,7 @@ function insert_extension_triggers(env::String, pkg::PkgId)::Union{Nothing,Missi
         proj_pkg = project_file_name_uuid(implicit_project_file, pkg.name)
         if pkg == proj_pkg
             d_proj = parsed_toml(implicit_project_file)
+            insert_subpackage_triggers(env, pkg, d_proj)
             extensions = get(d_proj, "extensions", nothing)::Union{Nothing, Dict{String, Any}}
             extensions === nothing && return
             weakdeps = get(Dict{String, Any}, d_proj, "weakdeps")::Dict{String,Any}
@@ -1964,51 +1933,46 @@ function insert_extension_triggers(env::String, pkg::PkgId)::Union{Nothing,Missi
         manifest_file = project_file_manifest_path(project_file)
         manifest_file === nothing && return
         d = get_deps(parsed_toml(manifest_file))
-        for (dep_name, entries) in d
-            entries = entries::Vector{Any}
-            for entry in entries
-                entry = entry::Dict{String, Any}
-                uuid = get(entry, "uuid", nothing)::Union{String, Nothing}
-                uuid === nothing && continue
-                if UUID(uuid) == pkg.uuid
-                    if get(entry, "path", nothing) === nothing && get(entry, "git-tree-sha1", nothing) === nothing
-                        # a stdlib entry is loaded from Sys.STDLIB (see `explicit_manifest_uuid_path`), and
-                        # the manifest may have been resolved by a Julia version whose copy of the stdlib
-                        # had different extensions, so take them from the stdlib's own Project.toml
-                        return insert_extension_triggers(Sys.STDLIB, pkg)
-                    end
-                    extensions = get(entry, "extensions", nothing)::Union{Nothing, Dict{String, Any}}
-                    extensions === nothing && return
-                    weakdeps = manifest_dep_names(get(Dict{String, Any}, entry, "weakdeps"))::Union{Vector{String}, Dict{String,Any}}
-                    deps = manifest_dep_names(get(Dict{String, Any}, entry, "deps"))::Union{Vector{String}, Dict{String,Any}}
-
-                    function expand_deps_list(deps′::Vector{String})
-                        deps′_expanded = Dict{String, Any}()
-                        for (dep_name, entries) in d
-                            dep_name in deps′ || continue
-                            entries = entries::Vector{Any}
-                            if length(entries) != 1
-                                error("expected a single entry for $(repr(dep_name)) in $(repr(project_file))")
-                            end
-                            local entry = first(entries)::Dict{String, Any}
-                            local uuid = entry["uuid"]::String
-                            deps′_expanded[dep_name] = uuid
-                        end
-                        return deps′_expanded
-                    end
-
-                    if weakdeps isa Vector{String}
-                        weakdeps = expand_deps_list(weakdeps)
-                    end
-                    if deps isa Vector{String}
-                        deps = expand_deps_list(deps)
-                    end
-
-                    total_deps = merge(weakdeps, deps)
-                    return _insert_extension_triggers(pkg, extensions, total_deps)
-                end
-            end
+        owner = manifest_owner_entry(manifest_file, d, pkg)
+        (owner === nothing || owner[3] !== nothing) && return nothing
+        entry = owner[2]
+        sub_d = manifest_entry_subpackage_dict(d, entry)
+        sub_d === nothing || insert_subpackage_triggers(env, pkg, sub_d)
+        if get(entry, "path", nothing) === nothing && get(entry, "git-tree-sha1", nothing) === nothing
+            # a stdlib entry is loaded from Sys.STDLIB (see `explicit_manifest_uuid_path`), and
+            # the manifest may have been resolved by a Julia version whose copy of the stdlib
+            # had different extensions, so take them from the stdlib's own Project.toml
+            return insert_extension_triggers(Sys.STDLIB, pkg)
         end
+        extensions = get(entry, "extensions", nothing)::Union{Nothing, Dict{String, Any}}
+        extensions === nothing && return
+        weakdeps = manifest_dep_names(get(Dict{String, Any}, entry, "weakdeps"))::Union{Vector{String}, Dict{String,Any}}
+        deps = manifest_dep_names(get(Dict{String, Any}, entry, "deps"))::Union{Vector{String}, Dict{String,Any}}
+
+        function expand_deps_list(deps′::Vector{String})
+            deps′_expanded = Dict{String, Any}()
+            for (dep_name, entries) in d
+                dep_name in deps′ || continue
+                entries = entries::Vector{Any}
+                if length(entries) != 1
+                    error("expected a single entry for $(repr(dep_name)) in $(repr(project_file))")
+                end
+                local entry = first(entries)::Dict{String, Any}
+                local uuid = entry["uuid"]::String
+                deps′_expanded[dep_name] = uuid
+            end
+            return deps′_expanded
+        end
+
+        if weakdeps isa Vector{String}
+            weakdeps = expand_deps_list(weakdeps)
+        end
+        if deps isa Vector{String}
+            deps = expand_deps_list(deps)
+        end
+
+        total_deps = merge(weakdeps, deps)
+        return _insert_extension_triggers(pkg, extensions, total_deps)
     end
     return nothing
 end
@@ -2074,35 +2038,9 @@ function subpackage_autoload_triggers(d::Dict{String, Any}, name::String)::Union
     return nothing
 end
 
-# The subpackage definitions of package `pkg` in environment `env`, as a dict shaped like a
-# parsed Project.toml: from the manifest entry of `pkg`, or from the Project.toml of `pkg`
-# itself when it is the active project or lives in an implicit environment.
-function package_subpackage_dict(env::String, pkg::PkgId)::Union{Nothing, Dict{String, Any}}
-    pkg.uuid === nothing && return nothing
-    project_file = env_project_file(env)
-    if project_file isa String
-        project_file_name_uuid(project_file, pkg.name) == pkg && return parsed_toml(project_file)
-        manifest_file = project_file_manifest_path(project_file)
-        manifest_file === nothing && return nothing
-        d = get_deps(parsed_toml(manifest_file))
-        for entry in get(Vector{Any}, d, pkg.name)::Vector{Any}
-            entry = entry::Dict{String, Any}
-            get(entry, "uuid", nothing) == string(pkg.uuid) || continue
-            return manifest_entry_subpackage_dict(d, entry)
-        end
-        return nothing
-    elseif project_file
-        _, implicit_project_file = entry_point_and_project_file(env, pkg.name)
-        implicit_project_file isa String || return nothing
-        project_file_name_uuid(implicit_project_file, pkg.name) == pkg || return nothing
-        return parsed_toml(implicit_project_file)
-    end
-    return nothing
-end
-
-function insert_subpackage_triggers(env::String, pkg::PkgId)
-    d = package_subpackage_dict(env, pkg)
-    d === nothing && return
+# `d` holds the subpackage definitions of `pkg`, shaped like a parsed Project.toml: its
+# Project.toml, or its manifest entry (see `manifest_entry_subpackage_dict`)
+function insert_subpackage_triggers(env::String, pkg::PkgId, d::Dict{String, Any})
     subs = get(d, "subpackages", nothing)::Union{Nothing, Dict{String, Any}}
     subs === nothing && return
     autoloads = Dict{String, Any}()
@@ -2451,7 +2389,7 @@ function package_subdeps_source(env::String, where::PkgId, entry_path::String)
         get(d, "uuid", nothing) == string(where.uuid) && return d, project_file
         manifest_file = project_file_manifest_path(project_file)
         if manifest_file !== nothing
-            owner = manifest_owner_entry(get_deps(parsed_toml(manifest_file)), where)
+            owner = manifest_owner_entry(manifest_file, get_deps(parsed_toml(manifest_file)), where)
             owner === nothing || return owner[2], manifest_file
         end
     end
