@@ -1,5 +1,5 @@
 module Plots
-using BDF
+using Solvers::BDF
 export plotit
 plotit() = "plot of " * BDF.solve(BDF.BDFAlg())
 end

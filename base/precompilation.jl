@@ -644,11 +644,15 @@ function ExplicitEnv(envpath::String)
         end
         uuids = UUID[]
         for trigger in triggers
-            uuid = get(project_name_to_uuid, trigger, nothing)
-            if uuid === nothing && proj_uuid !== nothing && Base.subpackage_deps(project_d, trigger) !== nothing
-                # a subpackage of the project
-                uuid = Base.uuid5(proj_uuid, trigger)
-                names[uuid] = trigger
+            ref = Base.subpackage_ref(trigger)
+            if ref === nothing
+                uuid = get(project_name_to_uuid, trigger, nothing)
+            else
+                # a subpackage of the project (`"::Sub"`) or of a dependency (`"Dep::Sub"`)
+                owner, sub = ref
+                owner_uuid = isempty(owner) || owner == proj_name ? proj_uuid : get(project_name_to_uuid, owner, nothing)
+                uuid = owner_uuid === nothing ? nothing : Base.uuid5(owner_uuid, sub)
+                uuid === nothing || (names[uuid] = sub)
             end
             if uuid === nothing
                 error("Trigger $trigger for extension $name not found in project")
@@ -724,7 +728,7 @@ function ExplicitEnv(envpath::String)
             extensions[m_uuid] = deps_pkg_concrete
 
             # Subpackages
-            sub_d = Base.manifest_entry_subpackage_dict(manifest_deps_d, pkg_info)
+            sub_d = Base.manifest_entry_subpackage_dict(manifest_deps_d, pkg_info, name)
             sub_d === nothing || (subpackage_defs[m_uuid] = sub_d)
 
             # Determine strategy to find package
@@ -795,19 +799,17 @@ function ExplicitEnv(envpath::String)
         for (ext, triggers) in exts
             triggers_expanded = UUID[]
             sizehint!(triggers_expanded, length(triggers))
-            sub_d = get(subpackage_defs, pkg, nothing)
             for trigger in triggers
-                # a subpackage of the package itself (its dependencies take precedence, as in
-                # `Base.insert_extension_triggers`: Pkg and registries reject a subpackage
-                # named like a dependency)
-                if sub_d !== nothing && Base.subpackage_deps(sub_d, trigger) !== nothing &&
-                        !haskey(sub_d["deps"]::Dict{String, Any}, trigger) &&
-                        !haskey(sub_d["weakdeps"]::Dict{String, Any}, trigger)
-                    uuid = Base.uuid5(pkg, trigger)
-                    names[uuid] = trigger
-                    push!(triggers_expanded, uuid)
-                else
+                ref = Base.subpackage_ref(trigger)
+                if ref === nothing
                     push!(triggers_expanded, name_to_uuid[trigger])
+                else
+                    # a subpackage of the package itself (`"::Sub"`) or of a dependency (`"Dep::Sub"`)
+                    owner, sub = ref
+                    owner_uuid = isempty(owner) || owner == names[pkg] ? pkg : name_to_uuid[owner]
+                    uuid = Base.uuid5(owner_uuid, sub)
+                    names[uuid] = sub
+                    push!(triggers_expanded, uuid)
                 end
             end
             exts_expanded[ext] = triggers_expanded
@@ -1090,8 +1092,10 @@ function add_subpackage_nodes!(direct_deps::Dict{PkgId, Vector{PkgId}}, parent_t
         sub = PkgId(Base.uuid5(pkg.uuid::UUID, name), name)
         deps = PkgId[pkg; direct_deps[pkg]]
         for dep in sub_deps
-            if Base.subpackage_deps(d, dep) !== nothing
-                push!(deps, PkgId(Base.uuid5(pkg.uuid::UUID, dep), dep))
+            sib = Base.subpackage_self_ref(dep, d)
+            if sib !== nothing
+                Base.subpackage_deps(d, sib) === nothing ||
+                    push!(deps, PkgId(Base.uuid5(pkg.uuid::UUID, sib), sib))
             elseif (uuid = get(weakdeps, dep, nothing)) !== nothing && UUID(uuid::String) in pkg_uuids
                 push!(deps, PkgId(UUID(uuid::String), dep))
             end
@@ -1141,9 +1145,8 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
         end
         subs_in_use[dep] = explicit
     end
-    is_sub_in_use(parent::UUID, uuid::UUID) =
-        haskey(subs_in_use, parent) && haskey(env.names, uuid) && env.names[uuid] in subs_in_use[parent] &&
-        uuid == Base.uuid5(parent, env.names[uuid])
+    # (an extension may be triggered by subpackages of its parent and of its dependencies)
+    sub_uuids_in_use = Set{UUID}(Base.uuid5(parent, name) for (parent, names) in subs_in_use for name in names)
 
     for dep in pkg_uuids
         haskey(env.deps, dep) || continue
@@ -1158,7 +1161,7 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
             all_triggers_available = true
             for trigger_uuid in trigger_uuids
                 trigger_name = PkgId(trigger_uuid, env.names[trigger_uuid])
-                if trigger_uuid in pkg_uuids || Base.in_sysimage(trigger_name) || is_sub_in_use(dep, trigger_uuid)
+                if trigger_uuid in pkg_uuids || Base.in_sysimage(trigger_name) || trigger_uuid in sub_uuids_in_use
                     push!(triggers[ext], trigger_name)
                 else
                     all_triggers_available = false

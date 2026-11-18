@@ -956,11 +956,15 @@ end
 #
 #     [subpackages]
 #     Common = []                       # code in sub/Common.jl or sub/Common/Common.jl
-#     Tsit5 = ["Common"]                # may depend on sibling subpackages...
-#     Plots = ["Common", "Makie"]       # ...and on [weakdeps] of the parent
-#     Recipes = { deps = ["Common", "Makie"], autoload = true }
+#     Tsit5 = ["::Common"]              # may depend on sibling subpackages...
+#     Plots = ["::Common", "Makie"]     # ...and on [weakdeps] of the parent
+#     Recipes = { deps = ["::Common", "Makie"], autoload = true }
 #
-# An entry may also be a table, `Tsit5 = { deps = ["Common"] }`. Its `autoload` key makes the
+# A sibling subpackage is written `"::Common"` (or `"Solvers::Common"`), a plain name is
+# always one of the parent's [deps] or [weakdeps] (see `subpackage_ref`), so a subpackage
+# may share its name with a dependency. In code, too, a sibling is loaded as
+# `using Solvers::Common`, and `using Common` means the dependency.
+# An entry may also be a table, `Tsit5 = { deps = ["::Common"] }`. Its `autoload` key makes the
 # subpackage load automatically, like an extension (see `subpackage_autoload_triggers`).
 # The identity of a subpackage is `PkgId(uuid5(parent_uuid, name), name)`, the same scheme
 # as for extensions. A subpackage may load the parent, any of the parent's [deps], and the
@@ -985,6 +989,35 @@ function subpackage_deps(d::Dict{String, Any}, name::String)::Union{Nothing, Vec
     return String[x::String for x in entry::Vector]
 end
 
+# A reference to a subpackage, in the dependency list of a subpackage or in the triggers of
+# an extension: `"::Sub"` (canonical) or `"Parent::Sub"`. Returns `(parent, sub)`, with
+# `parent` empty for `"::Sub"`, or `nothing` for a plain name, which is a dependency.
+function subpackage_ref(s::String)::Union{Nothing, Tuple{String, String}}
+    i = findfirst("::", s)
+    i === nothing && return nothing
+    return (s[1:prevind(s, first(i))], s[nextind(s, last(i)):end])
+end
+
+# The subpackage of the package itself that `s` names (`"::Sub"`, or `"Parent::Sub"` with
+# the package's own name, `self`), or `nothing`
+function subpackage_self_ref(s::String, self::Union{Nothing, String})::Union{Nothing, String}
+    ref = subpackage_ref(s)
+    ref === nothing && return nothing
+    parent, sub = ref
+    return isempty(parent) || parent == self ? sub : nothing
+end
+subpackage_self_ref(s::String, d::Dict{String, Any}) = subpackage_self_ref(s, get(d, "name", nothing)::Union{Nothing, String})
+
+# The sibling subpackages that subpackage `name` lists (directly)
+function subpackage_siblings(d::Dict{String, Any}, name::String)::Vector{String}
+    siblings = String[]
+    for dep in something(subpackage_deps(d, name), String[])
+        sib = subpackage_self_ref(dep, d)
+        sib === nothing || subpackage_deps(d, sib) === nothing || push!(siblings, sib)
+    end
+    return siblings
+end
+
 # (the cheap dictionary lookup goes first, so packages without subpackages never hash)
 is_subpackage_of(d::Dict{String, Any}, parent_uuid::UUID, sub::PkgId) =
     subpackage_deps(d, sub.name) !== nothing && sub.uuid == uuid5(parent_uuid, sub.name)
@@ -999,10 +1032,9 @@ function subpackage_dep_get(d::Dict{String, Any}, parent::PkgId, where::PkgId, n
         uuid = get(pdeps, name, nothing)::Union{Nothing, String}
         uuid === nothing || return PkgId(UUID(uuid), name)
     end
+    # a weak dependency of the parent that `where` lists (a sibling subpackage is not
+    # found by name: it is loaded as `using Parent::Sub`)
     if name in something(subpackage_deps(d, where.name))
-        # a sibling subpackage...
-        subpackage_deps(d, name) === nothing || return PkgId(uuid5(parent.uuid::UUID, name), name)
-        # ...or a weak dependency of the parent
         wdeps = get(d, "weakdeps", nothing)::Union{Nothing, Dict{String, Any}}
         if wdeps !== nothing
             uuid = get(wdeps, name, nothing)::Union{Nothing, String}
@@ -1035,7 +1067,7 @@ end
 # the parent of `where` is the manifest entry `entry` (for package `parent`) in manifest `d`
 function manifest_entry_subpackage_dep_get(d::Dict{String, Any}, parent::PkgId, entry::Dict{String, Any},
                                            where::PkgId, name::String)::Union{Nothing, PkgId}
-    sd = manifest_entry_subpackage_dict(d, entry)
+    sd = manifest_entry_subpackage_dict(d, entry, parent.name)
     sd === nothing && return nothing
     is_subpackage_of(sd, parent.uuid::UUID, where) || return nothing
     return subpackage_dep_get(sd, parent, where, name)
@@ -1050,13 +1082,14 @@ end
 #     BDF = ["Heavy"]
 #     [deps.Solvers.subdeps]              # copied from the package's [subdeps]
 #
-# Return a dict shaped like a parsed Project.toml (`subpackages`, and `deps` and
+# Return a dict shaped like a parsed Project.toml (`name` of the package, `subpackages`, and `deps` and
 # `weakdeps` as name => uuid), which the functions working on a parent's Project.toml
 # accept. `nothing` when the entry has no subpackages.
-function manifest_entry_subpackage_dict(d::Dict{String, Any}, entry::Dict{String, Any})::Union{Nothing, Dict{String, Any}}
+function manifest_entry_subpackage_dict(d::Dict{String, Any}, entry::Dict{String, Any}, name::String)::Union{Nothing, Dict{String, Any}}
     subs = get(entry, "subpackages", nothing)
     subs isa Dict{String, Any} || return nothing
     return Dict{String, Any}(
+        "name" => name,
         "subpackages" => subs,
         "deps" => manifest_expand_deps(d, get(entry, "deps", nothing)),
         "weakdeps" => manifest_expand_deps(d, get(entry, "weakdeps", nothing)))
@@ -1926,7 +1959,7 @@ function insert_extension_triggers(env::String, pkg::PkgId)::Union{Nothing,Missi
             extensions === nothing && return
             weakdeps = get(Dict{String, Any}, d_proj, "weakdeps")::Dict{String,Any}
             deps = get(Dict{String, Any}, d_proj, "deps")::Dict{String,Any}
-            total_deps = merge(subpackage_trigger_uuids(pkg, d_proj), weakdeps, deps)
+            total_deps = merge(weakdeps, deps)
             return _insert_extension_triggers(pkg, extensions, total_deps)
         end
 
@@ -1944,7 +1977,7 @@ function insert_extension_triggers(env::String, pkg::PkgId)::Union{Nothing,Missi
             # had different extensions, so take them from the stdlib's own Project.toml
             return insert_extension_triggers(Sys.STDLIB, pkg)
         end
-        sub_d = manifest_entry_subpackage_dict(d, entry)
+        sub_d = manifest_entry_subpackage_dict(d, entry, pkg.name)
         sub_d === nothing || insert_subpackage_triggers(env, pkg, sub_d)
         extensions = get(entry, "extensions", nothing)::Union{Nothing, Dict{String, Any}}
         extensions === nothing && return
@@ -1973,23 +2006,30 @@ function insert_extension_triggers(env::String, pkg::PkgId)::Union{Nothing,Missi
             deps = expand_deps_list(deps)
         end
 
-        total_deps = merge(sub_d === nothing ? Dict{String, Any}() : subpackage_trigger_uuids(pkg, sub_d),
-                           weakdeps, deps)
+        total_deps = merge(weakdeps, deps)
         return _insert_extension_triggers(pkg, extensions, total_deps)
     end
     return nothing
 end
 
-# An extension of a package may also be triggered by subpackages of that package (an
-# extension of the subpackage, in effect): their names map to their uuids
-function subpackage_trigger_uuids(pkg::PkgId, d::Dict{String, Any})
-    subs = get(d, "subpackages", nothing)::Union{Nothing, Dict{String, Any}}
-    uuids = Dict{String, Any}()
-    subs === nothing && return uuids
-    for name in keys(subs)
-        uuids[name] = string(uuid5(pkg.uuid::UUID, name))
+# The id of an extension trigger of `parent`: a name in `totaldeps` (its [deps] and
+# [weakdeps]), or a subpackage (see `subpackage_ref`): `"::Sub"` or `"Parent::Sub"` of
+# `parent` itself (an extension of the subpackage, in effect), `"Dep::Sub"` of dependency `Dep`
+function extension_trigger_id(parent::PkgId, trigger::String, totaldeps::Dict{String, Any})::Union{Nothing, PkgId}
+    ref = subpackage_ref(trigger)
+    if ref === nothing
+        uuid = get(totaldeps, trigger, nothing)::Union{Nothing, String}
+        return uuid === nothing ? nothing : PkgId(UUID(uuid), trigger)
     end
-    return uuids
+    owner, sub = ref
+    if isempty(owner) || owner == parent.name
+        owner_uuid = parent.uuid::UUID
+    else
+        uuid = get(totaldeps, owner, nothing)::Union{Nothing, String}
+        uuid === nothing && return nothing
+        owner_uuid = UUID(uuid)
+    end
+    return PkgId(uuid5(owner_uuid, sub), sub)
 end
 
 function _insert_extension_triggers(parent::PkgId, extensions::Dict{String, Any}, totaldeps::Dict{String, Any})
@@ -2005,9 +2045,9 @@ function _insert_extension_triggers(parent::PkgId, extensions::Dict{String, Any}
         trigger1 = get!(Vector{ExtensionId}, EXT_DORMITORY, parent)
         push!(trigger1, gid)
         for trigger in triggers
+            trigger_id = extension_trigger_id(parent, trigger, totaldeps)
             # TODO: Better error message if this lookup fails?
-            uuid_trigger = UUID(totaldeps[trigger]::String)
-            trigger_id = PkgId(uuid_trigger, trigger)
+            trigger_id === nothing && throw(KeyError(trigger))
             push!(trigger_ids, trigger_id)
             if !haskey(Base.loaded_modules, trigger_id) || haskey(package_locks, trigger_id)
                 trigger1 = get!(Vector{ExtensionId}, EXT_DORMITORY, trigger_id)
@@ -2185,8 +2225,8 @@ function subpackage_sibling_closure(d::Dict{String, Any}, name::String)
     todo = String[name]
     while !isempty(todo)
         sub = pop!(todo)
-        for dep in something(subpackage_deps(d, sub), String[])
-            if subpackage_deps(d, dep) !== nothing && dep != name && !(dep in siblings)
+        for dep in subpackage_siblings(d, sub)
+            if dep != name && !(dep in siblings)
                 push!(siblings, dep)
                 push!(todo, dep)
             end
@@ -2403,12 +2443,31 @@ function subpackage_declared(where::PkgId, parent::PkgId, sub::String, env::Unio
     end
     # developing the parent: the active project is the parent itself
     get(d, "uuid", nothing) == string(parent.uuid) && return true, nothing
+    # an extension triggered by the subpackage (`"Parent::Sub"`) may load it, as it may load
+    # its other triggers
+    where.uuid === nothing || is_subpackage_extension_trigger(d, where, parent, sub) && return true, project_file
     subdeps = get(d, "subdeps", nothing)::Union{Nothing, Dict{String, Any}}
     subdeps === nothing && return false, project_file
     declared = get(subdeps, parent.name, nothing)
     declared isa String && return declared == sub, project_file
     declared isa Vector && return sub in declared, project_file
     return false, project_file
+end
+
+# `d` is the Project.toml or manifest entry of a package: is `where` one of its extensions,
+# with subpackage `sub` of `parent` (a dependency) among its triggers?
+function is_subpackage_extension_trigger(d::Dict{String, Any}, where::PkgId, parent::PkgId, sub::String)
+    uuid = get(d, "uuid", nothing)
+    uuid isa String && where.uuid == uuid5(UUID(uuid), where.name) || return false
+    exts = get(d, "extensions", nothing)
+    exts isa Dict{String, Any} || return false
+    triggers = get(exts, where.name, nothing)
+    triggers isa String && (triggers = [triggers])
+    triggers isa Vector || return false
+    for t in triggers
+        t isa String && subpackage_ref(t) == (parent.name, sub) && return true
+    end
+    return false
 end
 
 # Where the [subdeps] of package `where` (or of the package that `where` is an extension or

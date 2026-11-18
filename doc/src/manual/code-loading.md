@@ -422,14 +422,18 @@ Heavy = "..."
 
 [subpackages]
 Common = []
-Tsit5 = ["Common"]
-BDF = ["Common", "Heavy"]
-Plots = { deps = ["BDF"], autoload = true }
+Tsit5 = ["::Common"]
+BDF = ["::Common", "Heavy"]
+Plots = { deps = ["::BDF"], autoload = true }
 ```
 
 The keys are the names of the subpackages, and each value lists the dependencies that the
 subpackage needs beyond what the parent provides: sibling subpackages, and packages from the
-parent's `[weakdeps]`. A subpackage may always load its parent and the parent's `[deps]`. The
+parent's `[weakdeps]`. A sibling subpackage is written `"::Common"` (`"Solvers::Common"` is
+accepted too), and a plain name is always one of the parent's dependencies, so a subpackage
+may share its name with a dependency. Likewise, in code a sibling is loaded as
+`using Solvers::Common`, and `using Common` means the dependency `Common`.
+A subpackage may always load its parent and the parent's `[deps]`. The
 entry point of subpackage `Tsit5` is `sub/Tsit5.jl` or `sub/Tsit5/Tsit5.jl`. A subpackage is
 identified by `PkgId(uuid5(parent_uuid, name), name)`, as an extension is.
 
@@ -468,16 +472,18 @@ subpackages that the environment uses autoload (and are precompiled): those that
 `[subdeps]` section in the workspace's projects or in the manifest lists, the sibling
 subpackages they need, and all of them in the parent's own environment.
 
-An extension of the parent may list subpackages of the parent among its triggers, which makes
-it an extension of those subpackages:
+An extension may list subpackages among its triggers, which makes it an extension of those
+subpackages: `"::Tsit5"` (or `"Solvers::Tsit5"`) for a subpackage of the package itself, and
+`"Dep::Sub"` for a subpackage of a package `Dep` in its `[deps]` or `[weakdeps]`:
 
 ```toml
 [extensions]
-Tsit5PlotsExt = ["Tsit5", "Makie"]
+Tsit5PlotsExt = ["::Tsit5", "Makie"]
 ```
 
 It loads once the parent, the subpackage `Tsit5` and `Makie` are loaded, and is precompiled
-after `Tsit5`. If the environment does not use `Tsit5`, it never loads.
+after `Tsit5`. If the environment does not use `Tsit5`, it never loads. An extension may load
+the subpackages of a dependency that trigger it without declaring them in `[subdeps]`.
 
 When a package with subpackages is added to an environment, its `[subpackages]` and
 `[subdeps]` sections are stored in its manifest entry, and the loader reads them from there.

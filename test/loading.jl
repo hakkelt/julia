@@ -2012,7 +2012,7 @@ inline(val) = val == 1 ? `--inline=yes` : `--inline=no`
         # an extension of the parent that names one of its subpackages among its triggers
         # extends that subpackage: it loads once the subpackage and the other triggers are
         # loaded, and is precompiled after the subpackage
-        function add_ext(d)
+        function add_ext(d; trigger = "::Tsit5")
             mkpath(joinpath(d, "Solvers", "ext"))
             write(joinpath(d, "Solvers", "ext", "Tsit5HelperExt.jl"), """
                 module Tsit5HelperExt
@@ -2021,20 +2021,23 @@ inline(val) = val == 1 ? `--inline=yes` : `--inline=no`
                 end
                 """)
             f = joinpath(d, "Solvers", "Project.toml")
-            write(f, read(f, String) * "\n[extensions]\nTsit5HelperExt = [\"Tsit5\", \"Helper\"]\n")
+            write(f, read(f, String) * "\n[extensions]\nTsit5HelperExt = [\"$trigger\", \"Helper\"]\n")
             replace_line(joinpath(d, "env", "Manifest.toml"), r"^\s*\[deps\.Solvers\.subpackages\]",
-                         "    [deps.Solvers.extensions]\n    Tsit5HelperExt = [\"Tsit5\", \"Helper\"]\n\n    [deps.Solvers.subpackages]")
+                         "    [deps.Solvers.extensions]\n    Tsit5HelperExt = [\"$trigger\", \"Helper\"]\n\n    [deps.Solvers.subpackages]")
         end
         ext_id = "Base.PkgId(Base.uuid5(Base.UUID(\"$solvers_uuid\"), \"Tsit5HelperExt\"), \"Tsit5HelperExt\")"
-        out, outerr, ok = run_subpkg("""
-            ext() = Base.get_extension(Solvers, :Tsit5HelperExt) !== nothing
-            using Solvers, Helper
-            print(ext(), "|")
-            using Solvers::Tsit5
-            print(ext(), "|", Tsit5.solve(Tsit5Alg(), Helper.helper))
-            """; edit! = add_ext)
-        @test ok
-        @test out == "false|true|tsit5 with helper"
+        # `"::Tsit5"`, or `"Solvers::Tsit5"` with the name of the package
+        for trigger in ("::Tsit5", "Solvers::Tsit5")
+            out, outerr, ok = run_subpkg("""
+                ext() = Base.get_extension(Solvers, :Tsit5HelperExt) !== nothing
+                using Solvers, Helper
+                print(ext(), "|")
+                using Solvers::Tsit5
+                print(ext(), "|", Tsit5.solve(Tsit5Alg(), Helper.helper))
+                """; edit! = d -> add_ext(d; trigger))
+            @test ok
+            @test out == "false|true|tsit5 with helper"
+        end
         # the parent loaded last (`Tsit5` does not load it, and `using Solvers::Tsit5` does not
         # bind it), once the other triggers are loaded
         out, outerr, ok = run_subpkg("""
@@ -2049,6 +2052,61 @@ inline(val) = val == 1 ? `--inline=yes` : `--inline=no`
             Base.Precompilation.precompilepkgs(; io = devnull)
             print(Base.isprecompiled($ext_id))
             """; edit! = add_ext)
+        @test ok
+        @test out == "true"
+    end
+
+    @testset "a subpackage named like a dependency" begin
+        # `Solvers::Helper` is a subpackage, the plain `Helper` (in the deps of `Lazy`, and in
+        # `using Helper` in its code) is the weak dependency
+        out, outerr, ok = run_subpkg("""
+            using Solvers::Helper
+            print(Helper.whoami(), "|")
+            using Solvers
+            H = Base.require(Base.PkgId(Base.UUID("55555555-5555-5555-5555-555555555555"), "Helper"))
+            lazy = Base.get_extension(Solvers, :Lazy)
+            print(lazy !== nothing && lazy.Helper === H)
+            """)
+        @test ok
+        @test out == "the subpackage|true"
+        # a sibling is not found by its plain name: `using Common` is not `using Solvers::Common`
+        out, outerr, ok = run_subpkg("using Solvers::Tsit5";
+            edit! = d -> replace_line(joinpath(d, "Solvers", "sub", "Tsit5", "Tsit5.jl"), "using Solvers::Common", "using Common"))
+        @test !ok
+        @test occursin("package Tsit5 does not have Common in its dependencies", outerr)
+    end
+
+    @testset "a subpackage of a dependency triggers an extension" begin
+        # `App` has an extension triggered by `Solvers::BDF`, which `App` does not declare in
+        # its [subdeps]: the extension loads it as a trigger
+        function add_app_ext(d)
+            mkpath(joinpath(d, "App", "ext"))
+            write(joinpath(d, "App", "ext", "AppBDFExt.jl"), """
+                module AppBDFExt
+                using App, Solvers::BDF
+                App.backend(alg::BDF.BDFAlg) = "app with " * BDF.solve(alg)
+                end
+                """)
+            write(joinpath(d, "App", "src", "App.jl"), replace(read(joinpath(d, "App", "src", "App.jl"), String),
+                  "run() =" => "function backend end\nrun() ="))
+            f = joinpath(d, "App", "Project.toml")
+            write(f, read(f, String) * "\n[extensions]\nAppBDFExt = \"Solvers::BDF\"\n")
+            replace_line(joinpath(d, "env", "Manifest.toml"), r"^\s*\[deps\.App\.subdeps\]",
+                         "    [deps.App.extensions]\n    AppBDFExt = \"Solvers::BDF\"\n\n    [deps.App.subdeps]")
+        end
+        out, outerr, ok = run_subpkg("""
+            using App
+            print(Base.get_extension(App, :AppBDFExt) !== nothing, "|")
+            using Solvers::BDF
+            print(Base.get_extension(App, :AppBDFExt) !== nothing, "|", App.backend(BDFAlg()))
+            """; edit! = add_app_ext)
+        @test ok
+        @test out == "false|true|app with bdf via heavy, parent loaded: true"
+        out, outerr, ok = run_subpkg("""
+            Base.Precompilation.precompilepkgs(; io = devnull)
+            u = Base.UUID("44444444-4444-4444-4444-444444444444")
+            print(Base.isprecompiled(Base.PkgId(Base.uuid5(u, "AppBDFExt"), "AppBDFExt")))
+            """; edit! = add_app_ext)
         @test ok
         @test out == "true"
     end

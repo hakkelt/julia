@@ -30,10 +30,11 @@ weakdeps = ["Heavy", "Helper"]
 
     [deps.Solvers.subpackages]
     Common = []
-    Tsit5 = ["Common"]
-    BDF = { deps = ["Common", "Heavy"] }
-    Plots = { deps = ["BDF"], autoload = true }
-    Recipes = { deps = ["Common", "Heavy", "Helper"], autoload = ["Heavy"] }
+    Helper = []
+    Tsit5 = ["::Common"]
+    BDF = { deps = ["::Common", "Heavy"] }
+    Plots = { deps = ["Solvers::BDF"], autoload = true }
+    Recipes = { deps = ["::Common", "Heavy", "Helper"], autoload = ["Heavy"] }
     Lazy = { deps = ["Helper"], autoload = true }
 
 [[deps.Light]]

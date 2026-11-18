@@ -11,11 +11,13 @@ Helper = "55555555-5555-5555-5555-555555555555"
 
 [subpackages]
 Common = []
-Tsit5 = ["Common"]
-BDF = { deps = ["Common", "Heavy"] }
+# named like the weakdep Helper: a plain name is always the dependency
+Helper = []
+Tsit5 = ["::Common"]
+BDF = { deps = ["::Common", "Heavy"] }
 # autoload = true: triggers are Heavy, inherited from sibling BDF
-Plots = { deps = ["BDF"], autoload = true }
+Plots = { deps = ["Solvers::BDF"], autoload = true }
 # list form: trigger on Heavy only, and load Helper itself
-Recipes = { deps = ["Common", "Heavy", "Helper"], autoload = ["Heavy"] }
+Recipes = { deps = ["::Common", "Heavy", "Helper"], autoload = ["Heavy"] }
 # autoload = true with Helper: only fires once Helper is loaded
 Lazy = { deps = ["Helper"], autoload = true }
