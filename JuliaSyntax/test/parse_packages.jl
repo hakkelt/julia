@@ -45,6 +45,11 @@ base_tests_path = joinpath(Sys.BINDIR, Base.DATAROOTDIR, "julia", "test")
             return nothing
         end
 
+        # The flisp parser does not know subpackage syntax, `using Parent::Sub`
+        if occursin(joinpath("project", "Subpackages"), f)
+            return nothing
+        end
+
         if endswith(f, "core.jl")
             # The test
             # @test Union{Tuple{T}, Tuple{T,Int}} where {T} === widen_diagonal(Union{Tuple{T}, Tuple{T,Int}} where {T})

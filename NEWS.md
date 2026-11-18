@@ -4,6 +4,11 @@ Julia v1.15 Release Notes
 New language features
 ---------------------
 
+* Packages can define subpackages: modules shipped inside a package that are precompiled and
+  loaded separately, on request, with `using Parent::Sub` or `using Parent::{Sub1, Sub2}`.
+  Packages that use one declare it in a `[subdeps]` section of their project file (prototype;
+  see the manual's code loading chapter).
+
 Language changes
 ----------------
 

@@ -857,6 +857,22 @@ tests = [
         ((v=v"1.5",), "import A as B") =>  "(import (error (as (importpath A) B)))"
         "using A as B"     =>  "(using (error (as (importpath A) B)))"
         "using A, B as C"  =>  "(using (importpath A) (error (as (importpath B) C)))"
+        # Subpackages
+        "using A::B"        => "(using (:: (importpath A) B))"
+        "import A::B"       => "(import (:: (importpath A) B))"
+        "using A::B, C"     => "(using (:: (importpath A) B) (importpath C))"
+        "import A::B as C"  => "(import (as (:: (importpath A) B) C))"
+        "using A::B: x, y"  => "(using (: (:: (importpath A) B) (importpath x) (importpath y)))"
+        "using A:: B"       => "(using (:: (importpath A) (error)))"
+        ((v=v"1.10",), "using A::B") => "(using (:: (importpath A) B))"
+        # with whitespace, `::` is left to the enclosing statement, where it is a type assertion
+        "using A :: B"      => "(using (importpath A))"
+        "using A::{B, C}"   => "(using (:: (importpath A) (braces B C)))"
+        "using A::{B,}"     => "(using (:: (importpath A) (braces B)))"
+        "using A::{\nB,\nC\n}"  => "(using (:: (importpath A) (braces B C)))"
+        "using A, A::{B}"   => "(using (importpath A) (:: (importpath A) (braces B)))"
+        "using A::{}"       => "(using (:: (importpath A) (braces (error))))"
+        "using A::{B C}"    => "(using (:: (importpath A) (braces B (error-t C))))"
         # parse_import_path
         # When parsing import we must split initial dots into nontrivial
         # leading dots for relative paths

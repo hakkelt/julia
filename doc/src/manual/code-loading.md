@@ -397,6 +397,99 @@ are stored in the manifest file in the section for that package. The dependency 
 a package are the same as for its "parent" except that the listed triggers are also considered as
 dependencies.
 
+### [Subpackages](@id man-subpackages)
+
+!!! warning "Prototype"
+    Subpackages are a prototype. Their syntax and semantics may change.
+
+A "subpackage" is a module that ships inside a package, shares that package's version and
+compat bounds, has its own precompile cache file, and is loaded only when it is asked for.
+Large packages can use subpackages to split themselves into parts that are installed,
+precompiled and loaded independently, without registering and versioning each part as a
+separate package. Subpackages are declared in the `[subpackages]` section of the parent
+package's project file:
+
+```toml
+name = "Solvers"
+uuid = "..."
+version = "1.2.3"
+
+[deps]
+Light = "..."
+
+[weakdeps]
+Heavy = "..."
+
+[subpackages]
+Common = []
+Tsit5 = ["::Common"]
+BDF = ["::Common", "Heavy"]
+Plots = { deps = ["::BDF"], autoload = true }
+```
+
+The keys are the names of the subpackages, and each value lists the dependencies that the
+subpackage needs beyond what the parent provides: sibling subpackages, and packages from the
+parent's `[weakdeps]`. A sibling subpackage is written `"::Common"` (`"Solvers::Common"` is
+accepted too), and a plain name is always one of the parent's dependencies, so a subpackage
+may share its name with a dependency. Likewise, in code a sibling is loaded as
+`using Solvers::Common`, and `using Common` means the dependency `Common`.
+A subpackage may always load its parent and the parent's `[deps]`. The
+entry point of subpackage `Tsit5` is `sub/Tsit5.jl` or `sub/Tsit5/Tsit5.jl`. A subpackage is
+identified by `PkgId(uuid5(parent_uuid, name), name)`, as an extension is.
+
+A subpackage is loaded with `using Parent::Sub` or `import Parent::Sub`, which also allow the
+usual forms `import Parent::Sub as S` and `using Parent::Sub: name`, in every
+[syntax version](@ref syntax-versioning). As for `using Sub`, the name `Sub` is bound in the
+current module. (With whitespace around `::`, `using A :: B` is still a type assertion on the
+`using` statement.) Several subpackages of the same package can be loaded at once with
+`using Parent::{Sub1, Sub2}`, also next to the parent itself, as in
+`using Parent, Parent::{Sub1}`. This form cannot be renamed with `as` or precede `:`.
+Loading a subpackage does not bring the parent's exported names into scope.
+
+Packages and projects that load a subpackage declare it in their `[subdeps]` section, next
+to the parent in their `[deps]`:
+
+```toml
+[deps]
+Solvers = "..."
+
+[subdeps]
+Solvers = ["Tsit5"]
+```
+
+The package manager reads `[subdeps]` to install the weak dependencies that the selected
+subpackages need (and only those), and to restrict the parent to versions that have them.
+Loading a subpackage that is not declared is an error. The parent, its extensions and its
+other subpackages need no declaration, nor does top-level code in an implicit environment.
+The parent's own environment, where the parent is the active project or a member of its
+workspace, includes all of its subpackages and needs no declaration either.
+
+A subpackage with `autoload = true` is also loaded automatically, like an extension, once its
+parent and the weak dependencies that it and its sibling dependencies need are loaded.
+`autoload` may also be a list of packages that trigger it. An autoloaded subpackage does not
+bring any names into scope, and `Base.get_extension(Parent, :Sub)` returns it. Only the
+subpackages that the environment uses autoload (and are precompiled): those that a
+`[subdeps]` section in the workspace's projects or in the manifest lists, the sibling
+subpackages they need, and all of them in the parent's own environment.
+
+An extension may list subpackages among its triggers, which makes it an extension of those
+subpackages: `"::Tsit5"` (or `"Solvers::Tsit5"`) for a subpackage of the package itself, and
+`"Dep::Sub"` for a subpackage of a package `Dep` in its `[deps]` or `[weakdeps]`:
+
+```toml
+[extensions]
+Tsit5PlotsExt = ["::Tsit5", "Makie"]
+```
+
+It loads once the parent, the subpackage `Tsit5` and `Makie` are loaded, and is precompiled
+after `Tsit5`. If the environment does not use `Tsit5`, it never loads. An extension may load
+the subpackages of a dependency that trigger it without declaring them in `[subdeps]`.
+
+When a package with subpackages is added to an environment, its `[subpackages]` and
+`[subdeps]` sections are stored in its manifest entry, and the loader reads them from there.
+The parent's project file is read only when the parent is the active project or is in a
+package directory.
+
 ### [Workspaces](@id workspaces)
 
 A project file can define a workspace by giving a set of projects that is part of that workspace:

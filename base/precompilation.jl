@@ -265,6 +265,7 @@ Base.@kwdef mutable struct PrecompileSession
     direct_deps::Dict{PkgId, Vector{PkgId}}
     ext_to_parent::Dict{PkgId, PkgId}
     parent_to_exts::Dict{PkgId, Vector{PkgId}}
+    sub_to_parent::Dict{PkgId, PkgId}  # subpackages (also autoloaded ones) => their parent
     triggers::Dict{PkgId, Vector{PkgId}}
     project_deps::Vector{PkgId}
     serial_deps::Vector{PkgId}
@@ -558,6 +559,12 @@ struct ExplicitEnv
                                       String,   # `path` entry
                                       Nothing,  # stdlib (no `path` nor `git-tree-sha1`)
                                       Missing}} # not present in the manifest
+    # Subpackages in use: those that the active project or a package in the manifest
+    # selects in its [subdeps] (which Pkg records in Manifest.toml)
+    subpackages::Dict{UUID, Vector{String}}
+    # The subpackage definitions of packages in the manifest, shaped like a parsed
+    # Project.toml (see `Base.manifest_entry_subpackage_dict`)
+    subpackage_defs::Dict{UUID, Dict{String, Any}}
     #prefs::Union{Nothing, Dict{String, Any}}
     #local_prefs::Union{Nothing, Dict{String, Any}}
 end
@@ -574,7 +581,9 @@ function ExplicitEnv(::Nothing, envpath::String="")
         Dict{UUID, Vector{UUID}}(),   # weakdeps
         Dict{UUID, Dict{String, Vector{UUID}}}(), # extensions
         Dict{UUID, String}(),     # names
-        Dict{UUID, Union{SHA1, String, Nothing, Missing}}())
+        Dict{UUID, Union{SHA1, String, Nothing, Missing}}(), # lookup_strategy
+        Dict{UUID, Vector{String}}(), # subpackages
+        Dict{UUID, Dict{String, Any}}()) # subpackage_defs
 end
 function ExplicitEnv(envpath::String)
     # Handle missing project file by creating an empty environment
@@ -635,7 +644,16 @@ function ExplicitEnv(envpath::String)
         end
         uuids = UUID[]
         for trigger in triggers
-            uuid = get(project_name_to_uuid, trigger, nothing)
+            ref = Base.subpackage_ref(trigger)
+            if ref === nothing
+                uuid = get(project_name_to_uuid, trigger, nothing)
+            else
+                # a subpackage of the project (`"::Sub"`) or of a dependency (`"Dep::Sub"`)
+                owner, sub = ref
+                owner_uuid = isempty(owner) || owner == proj_name ? proj_uuid : get(project_name_to_uuid, owner, nothing)
+                uuid = owner_uuid === nothing ? nothing : Base.uuid5(owner_uuid, sub)
+                uuid === nothing || (names[uuid] = sub)
+            end
             if uuid === nothing
                 error("Trigger $trigger for extension $name not found in project")
             end
@@ -654,6 +672,9 @@ function ExplicitEnv(envpath::String)
     extensions = Dict{UUID, Dict{String, Vector{String}}}()
     name_to_uuid = Dict{String, UUID}()
     lookup_strategy = Dict{UUID, Union{SHA1, String, Nothing, Missing}}()
+    subpackages = Dict{UUID, Vector{String}}()
+    subpackage_defs = Dict{UUID, Dict{String, Any}}()
+    manifest_deps_d = get_deps(manifest_d)
 
     sizehint!(deps, length(manifest_d))
     sizehint!(weakdeps, length(manifest_d))
@@ -706,6 +727,10 @@ function ExplicitEnv(envpath::String)
             end
             extensions[m_uuid] = deps_pkg_concrete
 
+            # Subpackages
+            sub_d = Base.manifest_entry_subpackage_dict(manifest_deps_d, pkg_info, name)
+            sub_d === nothing || (subpackage_defs[m_uuid] = sub_d)
+
             # Determine strategy to find package
             lookup_strat = begin
                 if (path = get(pkg_info, "path", nothing)::Union{String, Nothing}) !== nothing
@@ -732,6 +757,12 @@ function ExplicitEnv(envpath::String)
     if proj_name !== nothing && proj_uuid !== nothing
         deps_expanded[proj_uuid] = filter!(!=(proj_uuid), collect(values(project_deps)))
         extensions_expanded[proj_uuid] = project_extensions
+        if get(project_d, "subpackages", nothing) isa Dict{String, Any}
+            # the project is not in the manifest: its subpackages are defined, and their
+            # weak dependencies listed, in its own project file
+            subpackage_defs[proj_uuid] = project_d
+            weakdeps_expanded[proj_uuid] = collect(values(project_weakdeps))
+        end
         path = get(project_d, "path", nothing)::Union{String, Nothing}
         entry_point = path !== nothing ? path : dirname(envpath)
         lookup_strategy[proj_uuid] = entry_point
@@ -769,11 +800,37 @@ function ExplicitEnv(envpath::String)
             triggers_expanded = UUID[]
             sizehint!(triggers_expanded, length(triggers))
             for trigger in triggers
-                push!(triggers_expanded, name_to_uuid[trigger])
+                ref = Base.subpackage_ref(trigger)
+                if ref === nothing
+                    push!(triggers_expanded, name_to_uuid[trigger])
+                else
+                    # a subpackage of the package itself (`"::Sub"`) or of a dependency (`"Dep::Sub"`)
+                    owner, sub = ref
+                    owner_uuid = isempty(owner) || owner == names[pkg] ? pkg : name_to_uuid[owner]
+                    uuid = Base.uuid5(owner_uuid, sub)
+                    names[uuid] = sub
+                    push!(triggers_expanded, uuid)
+                end
             end
             exts_expanded[ext] = triggers_expanded
         end
         extensions_expanded[pkg] = exts_expanded
+    end
+
+    # The members of the workspace with subpackages are in the manifest only if something in
+    # the workspace depends on them
+    for file in Base.workspace_project_files(envpath)
+        member_d = parsed_toml(file)
+        member_uuid = get(member_d, "uuid", nothing)
+        (get(member_d, "subpackages", nothing) isa Dict{String, Any} && member_uuid isa String) || continue
+        get!(subpackage_defs, UUID(member_uuid), member_d)
+    end
+    # The subpackages in use (see `Base.environment_subpackage_requests`)
+    for (uuid, requested) in Base.environment_subpackage_requests(envpath)
+        d = get(subpackage_defs, uuid, nothing)
+        d === nothing && continue
+        subpackages[uuid] = requested === nothing ?
+            collect(keys(get(Dict{String, Any}, d, "subpackages")::Dict{String, Any})) : collect(requested)
     end
 
     fixup_stdlib_deps!(deps_expanded, weakdeps_expanded, extensions_expanded, names, lookup_strategy)
@@ -804,7 +861,7 @@ function ExplicitEnv(envpath::String)
     return ExplicitEnv(envpath, project_deps, project_weakdeps, project_extras,
                        project_extensions, workspace_deps,
                        deps_expanded, weakdeps_expanded, extensions_expanded,
-                       names, lookup_strategy, #=prefs, local_prefs=#)
+                       names, lookup_strategy, subpackages, subpackage_defs #=prefs, local_prefs=#)
 end
 
 function collect_workspace_deps(project_file::String)
@@ -911,13 +968,20 @@ end
 ## Dependency graph
 
 # name or parent → ext
-function full_name(ext_to_parent::Dict{PkgId, PkgId}, pkg::PkgId)
-    if haskey(ext_to_parent, pkg)
+function full_name(ext_to_parent::Dict{PkgId, PkgId}, pkg::PkgId,
+                   sub_to_parent::Dict{PkgId, PkgId} = Dict{PkgId, PkgId}())
+    if haskey(sub_to_parent, pkg)
+        # written as in `using Parent::Sub`: a subpackage may well be named like an
+        # unrelated package (the one it replaced, for instance)
+        return string(sub_to_parent[pkg].name, "::", pkg.name)
+    elseif haskey(ext_to_parent, pkg)
         return string(ext_to_parent[pkg].name, " → ", pkg.name)
     else
         return pkg.name
     end
 end
+
+full_name(s, pkg::PkgId) = full_name(s.ext_to_parent, pkg, s.sub_to_parent)
 
 function excluded_circular_deps_explanation(io::IOContext, ext_to_parent::Dict{PkgId, PkgId}, circular_deps, cycles)
     outer_deps = copy(circular_deps)
@@ -1015,8 +1079,36 @@ function visit_indirect_deps!(direct_deps::Dict{PkgId, Vector{PkgId}}, visited::
     return
 end
 
+# Add nodes for the subpackages `names` of `pkg` (closed under the siblings they need).
+# A subpackage may load the parent, the parent's deps and the weakdeps and siblings it lists
+# (from the parent's manifest entry, `d`).
+function add_subpackage_nodes!(direct_deps::Dict{PkgId, Vector{PkgId}}, parent_to_subs::Dict{PkgId, Vector{PkgId}},
+                               pkg::PkgId, d::Dict{String, Any}, names::Set{String}, pkg_uuids::Set{UUID})
+    weakdeps = get(Dict{String, Any}, d, "weakdeps")::Dict{String, Any}
+    subs = PkgId[]
+    for name in names
+        sub_deps = Base.subpackage_deps(d, name)
+        sub_deps === nothing && continue
+        sub = PkgId(Base.uuid5(pkg.uuid::UUID, name), name)
+        deps = PkgId[pkg; direct_deps[pkg]]
+        for dep in sub_deps
+            sib = Base.subpackage_self_ref(dep, d)
+            if sib !== nothing
+                Base.subpackage_deps(d, sib) === nothing ||
+                    push!(deps, PkgId(Base.uuid5(pkg.uuid::UUID, sib), sib))
+            elseif (uuid = get(weakdeps, dep, nothing)) !== nothing && UUID(uuid::String) in pkg_uuids
+                push!(deps, PkgId(UUID(uuid::String), dep))
+            end
+        end
+        direct_deps[sub] = filter!(!Base.in_sysimage, unique!(deps))
+        push!(subs, sub)
+    end
+    isempty(subs) || (parent_to_subs[pkg] = subs)
+    return
+end
+
 # Build dependency graph from an ExplicitEnv.
-# Returns a NamedTuple of (direct_deps, ext_to_parent, parent_to_exts, triggers, project_deps, serial_deps).
+# Returns a NamedTuple of (direct_deps, ext_to_parent, parent_to_exts, sub_to_parent, triggers, project_deps, serial_deps).
 function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, requested_pkgids::Vector{PkgId})
     direct_deps = Dict{PkgId, Vector{PkgId}}()
     parent_to_exts = Dict{PkgId, Vector{PkgId}}()
@@ -1031,6 +1123,30 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
     for uuid in root_uuids
         _collect_reachable!(pkg_uuids, env.deps, uuid)
     end
+    # The weak dependencies of a package with subpackages in use are in the manifest only
+    # if one of those needs them; nothing lists them in `deps`
+    for uuid in collect(pkg_uuids)
+        haskey(env.subpackages, uuid) || continue
+        for weak in get(Vector{UUID}, env.weakdeps, uuid)
+            haskey(env.deps, weak) && _collect_reachable!(pkg_uuids, env.deps, weak)
+        end
+    end
+
+    # The subpackages in use, by parent, with the sibling subpackages they need: these get
+    # nodes (below) and may trigger extensions of their parent
+    subs_in_use = Dict{UUID, Set{String}}()
+    for dep in pkg_uuids
+        (haskey(env.subpackage_defs, dep) && haskey(env.deps, dep)) || continue
+        selected = get(Vector{String}, env.subpackages, dep)
+        isempty(selected) && continue
+        explicit = Set{String}(selected)
+        for sub in selected
+            union!(explicit, Base.subpackage_sibling_closure(env.subpackage_defs[dep], sub))
+        end
+        subs_in_use[dep] = explicit
+    end
+    # (an extension may be triggered by subpackages of its parent and of its dependencies)
+    sub_uuids_in_use = Set{UUID}(Base.uuid5(parent, name) for (parent, names) in subs_in_use for name in names)
 
     for dep in pkg_uuids
         haskey(env.deps, dep) || continue
@@ -1045,7 +1161,7 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
             all_triggers_available = true
             for trigger_uuid in trigger_uuids
                 trigger_name = PkgId(trigger_uuid, env.names[trigger_uuid])
-                if trigger_uuid in pkg_uuids || Base.in_sysimage(trigger_name)
+                if trigger_uuid in pkg_uuids || Base.in_sysimage(trigger_name) || trigger_uuid in sub_uuids_in_use
                     push!(triggers[ext], trigger_name)
                 else
                     all_triggers_available = false
@@ -1063,6 +1179,46 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
         end
     end
 
+    # Subpackages in use get a node each, as do the sibling subpackages they need.
+    # Autoloaded subpackages whose triggers are all available do too, and are handled
+    # like extensions from here on: they are loaded wherever their triggers are.
+    parent_to_subs = Dict{PkgId, Vector{PkgId}}()
+    for dep in pkg_uuids
+        haskey(env.subpackage_defs, dep) || continue
+        pkg = PkgId(dep, env.names[dep])
+        haskey(direct_deps, pkg) || continue
+        d = env.subpackage_defs[dep]
+        explicit = get(subs_in_use, dep, nothing)
+        explicit === nothing && continue
+        autoloads = Dict{PkgId, Vector{PkgId}}()
+        weakdeps_d = get(Dict{String, Any}, d, "weakdeps")::Dict{String, Any}
+        deps_d = get(Dict{String, Any}, d, "deps")::Dict{String, Any}
+        for name in keys(get(Dict{String, Any}, d, "subpackages")::Dict{String, Any})
+            # only the subpackages in use are installed and autoload
+            name in explicit || continue
+            trigger_names = Base.subpackage_autoload_triggers(d, name)
+            trigger_names === nothing && continue
+            trigger_ids = PkgId[pkg]
+            for trigger in trigger_names
+                uuid = get(weakdeps_d, trigger, get(deps_d, trigger, nothing))
+                uuid === nothing && break
+                id = PkgId(UUID(uuid::String), trigger)
+                (id.uuid in pkg_uuids || Base.in_sysimage(id)) || break
+                push!(trigger_ids, id)
+            end
+            # all triggers available
+            length(trigger_ids) == 1 + length(trigger_names) || continue
+            autoloads[PkgId(Base.uuid5(dep, name), name)] = trigger_ids
+        end
+        add_subpackage_nodes!(direct_deps, parent_to_subs, pkg, d, explicit, pkg_uuids)
+        for (id, trigger_ids) in autoloads
+            haskey(direct_deps, id) || continue
+            ext_to_parent[id] = pkg
+            triggers[id] = filter(!Base.in_sysimage, trigger_ids)
+            push!(get!(Vector{PkgId}, parent_to_exts, pkg), id)
+        end
+    end
+
     project_deps = PkgId[]
     if manifest
         for (uuid, name) in env.workspace_deps
@@ -1076,6 +1232,27 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
     filter!(!Base.in_sysimage, project_deps)
     # consider exts of project deps to be project deps so that errors are reported
     append!(project_deps, keys(filter(d -> last(d) in project_deps, ext_to_parent)))
+    # ... and their subpackages in use too
+    for (parent, subs) in parent_to_subs
+        parent in project_deps && append!(project_deps, subs)
+    end
+
+    # A package that depends on the parent may load its subpackages, so it waits for them.
+    # Not the packages that the subpackages themselves need, which would be a cycle.
+    for (parent, subs) in parent_to_subs
+        needed_by_subs = Set{PkgId}()
+        for sub in subs
+            visit_indirect_deps!(direct_deps, Set{PkgId}(), sub, needed_by_subs)
+        end
+        for (pkg, deps) in direct_deps
+            (pkg in subs || pkg in needed_by_subs || !(parent in deps)) && continue
+            # nor do the parent's other (autoloaded) subpackages
+            pkg.uuid !== nothing && pkg.uuid == Base.uuid5(parent.uuid::UUID, pkg.name) && continue
+            for sub in subs
+                sub in deps || push!(deps, sub)
+            end
+        end
+    end
 
     # An extension effectively depends on another extension if it has a strict superset of its triggers
     for ext_a in keys(ext_to_parent)
@@ -1103,11 +1280,14 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
         end
         for ext in keys(ext_to_parent)
             ext_loadable_in_pkg = Dict{PkgId,Bool}()
+            ext_triggers = filter(!Base.in_sysimage, triggers[ext])
             for pkg in keys(direct_deps)
-                is_trigger = in(pkg, direct_deps[ext])
+                # (an autoloaded subpackage may depend on more than its triggers, and is not
+                # loadable in the packages it depends on itself)
+                is_dependency = pkg == ext || in(pkg, indirect_deps[ext])
                 is_extension = in(pkg, keys(ext_to_parent))
-                has_triggers = issubset(direct_deps[ext], indirect_deps[pkg])
-                ext_loadable_in_pkg[pkg] = !is_extension && has_triggers && !is_trigger
+                has_triggers = issubset(ext_triggers, indirect_deps[pkg])
+                ext_loadable_in_pkg[pkg] = !is_extension && has_triggers && !is_dependency
             end
             for (pkg, ext_loadable) in ext_loadable_in_pkg
                 if ext_loadable && !any((dep)->ext_loadable_in_pkg[dep], direct_deps[pkg])
@@ -1135,7 +1315,14 @@ function build_dep_graph(env::ExplicitEnv, manifest::Bool, _from_loading::Bool, 
         end
     end
 
-    return (; direct_deps, ext_to_parent, parent_to_exts, triggers, project_deps, serial_deps)
+    sub_to_parent = Dict{PkgId, PkgId}(sub => parent for (parent, subs) in parent_to_subs for sub in subs)
+    for (ext, parent) in ext_to_parent
+        # autoloaded subpackages (and not extensions)
+        d = get(env.subpackage_defs, parent.uuid::UUID, nothing)
+        (d === nothing || Base.subpackage_deps(d, ext.name) === nothing) && continue
+        sub_to_parent[ext] = parent
+    end
+    return (; direct_deps, ext_to_parent, parent_to_exts, sub_to_parent, triggers, project_deps, serial_deps)
 end
 
 # Detect circular dependencies and notify their Events so waiting tasks can skip them.
@@ -2199,7 +2386,7 @@ function make_signal_channel()
 end
 
 function describe_pkg(s::PrecompileSession, pkg::PkgId, is_project_dep::Bool, is_serial_dep::Bool, flags::Cmd, cacheflags::Base.CacheFlags)
-    name = full_name(s.ext_to_parent, pkg)
+    name = full_name(s, pkg)
     name = is_project_dep ? name : color_string(name, :light_black, s.hascolor)
     if is_serial_dep
         name *= color_string(" (serial)", :light_black, s.hascolor)
@@ -2275,7 +2462,7 @@ function loaded_version_conflicts(s::PrecompileSession, pkgs)
         haskey(s.direct_deps, pkg) && collect_all_deps(s.direct_deps, pkg, deps)
     end
     conflicts = PkgId[pkg for pkg in deps if pkg in s.start_loaded_modules && loaded_version_differs(pkg)]
-    return sort!([full_name(s.ext_to_parent, pkg) for pkg in conflicts])
+    return sort!([full_name(s, pkg) for pkg in conflicts])
 end
 
 # The version the loader uses for `pkg`: the loaded one, or else the one in the first
@@ -2538,7 +2725,7 @@ function precompilepkgs_monitor_std(s::PrecompileSession, pkg_config, job::Preco
         if !thistaskwaiting && occursin("Waiting for background task / IO / timer", str)
             thistaskwaiting = true
             !liveprinting && !s.fancyprint && BG.monitoring && @lock s.print_lock begin
-                println(s.io, full_name(s.ext_to_parent, pkg), color_string(str, Base.warn_color(), s.hascolor))
+                println(s.io, full_name(s, pkg), color_string(str, Base.warn_color(), s.hascolor))
             end
             job.waiting_for_bg = true
         elseif !thistaskwaiting
@@ -2665,7 +2852,7 @@ function failed_dependency(s::PrecompileSession, deps::Vector{PkgId}, config::Co
     for dep in deps
         job = @lock s.print_lock get(s.jobs, (dep, config), nothing)
         job === nothing && continue
-        is_failed(job) && had_pid(job) && return full_name(s.ext_to_parent, dep)
+        is_failed(job) && had_pid(job) && return full_name(s, dep)
         is_dep_failed(job) && return job.error_msg
     end
     return nothing
@@ -2805,7 +2992,7 @@ function spawn_precompile_tasks!(s::PrecompileSession;
                                                   preresolved=preresolved_snapshot(s))
                             end
                         else
-                            fullname = full_name(s.ext_to_parent, pkg)
+                            fullname = full_name(s, pkg)
                             Base.errormonitor(Threads.@spawn :samepool begin
                                 pid = try; take!(pid_ch); catch; Int32(0); end
                                 pid > 0 && @lock s.print_lock set_pid!(job, pid)
@@ -2948,6 +3135,7 @@ function drain_work_channel!(s::PrecompileSession, work_channel::Channel{Precomp
                     merge!(s.direct_deps, new_graph.direct_deps)
                     merge!(s.ext_to_parent, new_graph.ext_to_parent)
                     merge!(s.parent_to_exts, new_graph.parent_to_exts)
+                    merge!(s.sub_to_parent, new_graph.sub_to_parent)
                     merge!(s.triggers, new_graph.triggers)
                     union!(s.project_deps, new_graph.project_deps)
                     union!(s.serial_deps, new_graph.serial_deps)
@@ -3096,7 +3284,7 @@ function report_precompile_results!(s::PrecompileSession)
                     elseif isempty(s.requested_pkgids) || s.requested_all
                         "packages finished."
                     else
-                        "$(join((full_name(s.ext_to_parent, p) for p in s.requested_pkgids), ", ", " and ")) finished."
+                        "$(join((full_name(s, p) for p in s.requested_pkgids), ", ", " and ")) finished."
                     end
                     printpkgstyle(iostr, :Precompiling, what)
                 end
@@ -3109,12 +3297,12 @@ function report_precompile_results!(s::PrecompileSession)
                     print(iostr, ".")
                 end
                 if s.n_loaded > 0
-                    loaded_names_vec = sort!([full_name(s.ext_to_parent, p) for p in s.loaded_pkgs])
+                    loaded_names_vec = sort!([full_name(s, p) for p in s.loaded_pkgs])
                     if s._from_loading && !s.ignore_loaded
                         # loading compiles dependents for the loaded version, so the loaded
                         # package is the reason for this session rather than its result;
                         # say so here for those not already explained under the header
-                        differing = sort!([full_name(s.ext_to_parent, p) for p in s.loaded_pkgs if loaded_version_differs(p)])
+                        differing = sort!([full_name(s, p) for p in s.loaded_pkgs if loaded_version_differs(p)])
                         unexplained = setdiff(differing, s.explained_conflicts)
                         if !isempty(unexplained)
                             print(iostr, "\n", loaded_conflicts_message(unexplained, s.hascolor; ongoing=false, cancelable=false))
@@ -3226,7 +3414,7 @@ function report_precompile_results!(s::PrecompileSession)
                         else
                             join(split(err, "\n"), color_string("\n│  ", Base.warn_color(), s.hascolor))
                         end
-                        name = full_name(s.ext_to_parent, pkg)
+                        name = full_name(s, pkg)
                         print(iostr, color_string("\n┌ ", Base.warn_color(), s.hascolor), name, color_string("\n│  ", Base.warn_color(), s.hascolor), err, color_string("\n└  ", Base.warn_color(), s.hascolor))
                     end
                 end
@@ -3241,7 +3429,7 @@ function report_precompile_results!(s::PrecompileSession)
         for ((dep, config), job) in s.jobs
             is_failed(job) || continue
             write(err_str, "\n")
-            print(err_str, "\n", full_name(s.ext_to_parent, dep), " ")
+            print(err_str, "\n", full_name(s, dep), " ")
             join(err_str, config[1], " ")
             print(err_str, "\n", job.error_msg)
         end
@@ -3424,7 +3612,7 @@ function do_precompile(pkgs::Union{Vector{String}, Vector{PkgId}},
         start_loaded_modules=Set{PkgId}(keys(Base.loaded_modules)), requested_pkgids, requested_all,
         direct_deps=graph.direct_deps,
         ext_to_parent=graph.ext_to_parent, parent_to_exts=graph.parent_to_exts,
-        triggers=graph.triggers, project_deps=graph.project_deps,
+        sub_to_parent=graph.sub_to_parent, triggers=graph.triggers, project_deps=graph.project_deps,
         serial_deps=graph.serial_deps, circular_deps,
         n_total=length(graph.direct_deps) * nconfigs,
         printloop_should_exit=!fancyprint, target,

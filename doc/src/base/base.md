@@ -548,6 +548,7 @@ Base.locate_package
 Base.compilecache
 Base.isprecompiled
 Base.get_extension
+Base.require_subpackage
 ```
 
 ## Internals
